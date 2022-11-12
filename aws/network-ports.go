@@ -47,14 +47,14 @@ type NetworkAcl struct {
 	ID      string
 	VpcId   string
 	Subnets []string
-	Rules   []NaclRule
+	head    *Node
+	tail    *Node
 }
 
 type NaclRule struct {
 	RuleNumber int32
 	Protocol   string
 	Cidr       string
-	Egress     bool
 	PortRange  []int32
 	Action     bool
 }
@@ -69,6 +69,26 @@ type SecurityGroupRule struct {
 	Protocol string
 	Cidr     []string
 	Ports    []int32
+}
+
+type ports []int32
+
+func (p ports) Len() int {
+	return len(p)
+}
+
+func (p ports) Less(i, j int) bool {
+	return p[i] < p[j]
+}
+
+func (p ports) Swap(i, j int) {
+	p[i], p[j] = p[j], p[i]
+}
+
+var naclToSG = map[string]string{
+	"-1": "-1",
+	"6":  "tcp",
+	"17": "udp",
 }
 
 func (m *NetworkPortsModule) PrintNetworkPorts(outputFormat string, outputDirectory string, verbosity int) {
@@ -179,8 +199,33 @@ func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver 
 	for _, instance := range m.getEC2Instances(r) {
 		fmt.Printf("Instance: %s\n", aws.ToString(instance.InstanceId))
 		fmt.Printf("Network interfaces: %v\n", instance.NetworkInterfaces)
-		fmt.Printf("Private IP: %s\n", aws.ToString(instance.PrivateIpAddress))
-		fmt.Printf("Public IP: %s\n", aws.ToString(instance.PublicIpAddress))
+		// TODO. Loop through NICs and grab IPs instead
+		var ipv4, ipv6 []string
+		for _, nic := range instance.NetworkInterfaces {
+			// ipv4
+			for _, addr := range nic.PrivateIpAddresses {
+				// Public
+				if addr.Association != nil {
+					if addr.Association.PublicIp != nil {
+						ipv4 = addHost(ipv4, aws.ToString(addr.Association.PublicIp))
+					}
+				}
+
+				// Private
+				if addr.PrivateIpAddress != nil {
+					ipv4 = addHost(ipv4, aws.ToString(addr.PrivateIpAddress))
+				}
+			}
+
+			// ipv6
+			for _, addr := range nic.Ipv6Addresses {
+				if addr.Ipv6Address != nil {
+					ipv6 = addHost(ipv6, aws.ToString(addr.Ipv6Address))
+				}
+			}
+		}
+		fmt.Printf("IPV4s: %v\n", ipv4)
+		fmt.Printf("IPV6s: %v\n", ipv6)
 		fmt.Printf("Security Groups: \n")
 		var groups []SecurityGroup
 		// Loop through the NICs as not all NIC SGs are added to instance.SecurityGroups
@@ -206,7 +251,30 @@ func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver 
 		}
 		fmt.Printf("Vpc ID: %s\n", aws.ToString(instance.VpcId))
 
-		m.resolveNetworkAccess(groups, networkAcls)
+		tcpPorts, udpPorts := m.resolveNetworkAccess(groups, networkAcls)
+
+		fmt.Printf("Done analyzing rules!\nPrinting: %v\n", ipv4)
+
+		// IPV4
+		if len(ipv4) > 0 {
+
+			if len(tcpPorts) > 0 {
+				fmt.Printf("sudo nmap -sV -p %s %s\n", strings.Join(tcpPorts, ","), strings.Join(ipv4, " "))
+			}
+			if len(udpPorts) > 0 {
+				fmt.Printf("sudo nmap -sU -sV -p %s %s\n", strings.Join(udpPorts, ","), strings.Join(ipv4, " "))
+			}
+		}
+
+		// IPV6
+		if len(ipv6) > 0 {
+			if len(tcpPorts) > 0 {
+				fmt.Printf("sudo nmap -6 -sV -p %s %s\n", strings.Join(tcpPorts, ","), strings.Join(ipv6, " "))
+			}
+			if len(udpPorts) > 0 {
+				fmt.Printf("sudo nmap -6 -sU -sV -p %s %s\n", strings.Join(udpPorts, ","), strings.Join(ipv6, " "))
+			}
+		}
 	}
 }
 
@@ -345,37 +413,44 @@ func (m *NetworkPortsModule) parseNacl(nacl types.NetworkAcl) NetworkAcl {
 
 	var rules []NaclRule
 	for _, entry := range nacl.Entries {
-		ruleNumber := aws.ToInt32(entry.RuleNumber)
-		protocol := aws.ToString(entry.Protocol)
-		cidr := aws.ToString(entry.CidrBlock)
-		egress := aws.ToBool(entry.Egress)
-		var portRange []int32
-		if entry.PortRange == nil {
-			portRange = generateRange(0, 65535)
-		} else {
-			portRange = generateRange(aws.ToInt32((*entry.PortRange).From), aws.ToInt32((*entry.PortRange).To))
+		if aws.ToBool(entry.Egress) == false {
+			ruleNumber := aws.ToInt32(entry.RuleNumber)
+			protocol := aws.ToString(entry.Protocol)
+			cidr := aws.ToString(entry.CidrBlock)
+			var portRange []int32
+			if entry.PortRange == nil {
+				portRange = generateRange(0, 65535)
+			} else {
+				portRange = generateRange(aws.ToInt32((*entry.PortRange).From), aws.ToInt32((*entry.PortRange).To))
+			}
+			action := (entry.RuleAction == "allow")
+			rules = append(rules, NaclRule{
+				RuleNumber: ruleNumber,
+				Protocol:   protocol,
+				Cidr:       cidr,
+				PortRange:  portRange,
+				Action:     action,
+			})
 		}
-		action := (entry.RuleAction == "allow")
-		rules = append(rules, NaclRule{
-			RuleNumber: ruleNumber,
-			Protocol:   protocol,
-			Cidr:       cidr,
-			Egress:     egress,
-			PortRange:  portRange,
-			Action:     action,
-		})
 	}
 
+	// Sort descending
 	sort.Slice(rules, func(i, j int) bool {
-		return rules[i].RuleNumber < rules[j].RuleNumber
+		return rules[i].RuleNumber > rules[j].RuleNumber
 	})
 
-	return NetworkAcl{
+	naclList := NetworkAcl{
 		ID:      id,
 		VpcId:   vpcId,
 		Subnets: subnets,
-		Rules:   rules,
 	}
+
+	// Iterate over rules and create linked list
+	for _, rule := range rules {
+		naclList.Insert(rule)
+	}
+
+	return naclList
 }
 
 func printNacl(nacl types.NetworkAcl) {
@@ -438,8 +513,8 @@ func (m *NetworkPortsModule) getEC2Instances(region string) []types.Instance {
 	return instances
 }
 
-func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) {
-	fmt.Printf("%v\n", nacls)
+func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) ([]string, []string) {
+	// fmt.Printf("%v\n", nacls)
 
 	// SGs allow access to ports
 
@@ -455,33 +530,40 @@ func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls 
 
 	*/
 
+	var udpPorts ports
+	var tcpPorts ports
+
 	for _, group := range groups {
-		// var udpPorts []int32
-		var tcpPorts []int32
 		for _, rule := range group.Rules {
 			for _, nacl := range nacls {
-				for _, nrule := range nacl.Rules {
-					// For port in rule, see if it is in nrule
-					for _, port := range rule.Ports {
-						if contains(nrule.PortRange, port) && nrule.Action {
-							// Protocol check
-							// TODO
-							tcpPorts = append(tcpPorts, port)
+				for _, port := range rule.Ports {
+					res, naclRule := nacl.Evaluate(port, rule.Protocol)
+					if res && naclToSG[naclRule.Protocol] == rule.Protocol {
+						// fmt.Printf("naclRule proto == rule.Protocol\n")
+						// fmt.Printf("Rule that approved is %v\n", naclRule)
+						if rule.Protocol == "-1" {
+							tcpPorts = addPort(tcpPorts, port)
+							udpPorts = addPort(udpPorts, port)
+						} else if rule.Protocol == "tcp" {
+							tcpPorts = addPort(tcpPorts, port)
+						} else if rule.Protocol == "udp" {
+							udpPorts = addPort(udpPorts, port)
 						}
 					}
 				}
 			}
 		}
-		fmt.Printf("Ports are %v\n", tcpPorts)
 	}
+
+	sort.Sort(tcpPorts)
+	sort.Sort(udpPorts)
+	fmt.Printf("TCP Ports are %v\n", prettyPorts(tcpPorts))
+	fmt.Printf("UDP Ports are %v\n", prettyPorts(udpPorts))
+
+	return prettyPorts(tcpPorts), prettyPorts(udpPorts)
 }
 
 func generateRange(start int32, end int32) []int32 {
-	// DEBUG
-	if start == int32(0) && end == int32(65535) {
-		return []int32{0}
-	}
-	// DEBUG
 	arr := make([]int32, end-start+1)
 	for i := int32(0); int(i) < len(arr); i++ {
 		arr[i] = i + start
@@ -490,6 +572,9 @@ func generateRange(start int32, end int32) []int32 {
 }
 
 func contains(arr []int32, v int32) bool {
+	if len(arr) == 65536 && arr[0] == int32(0) && arr[len(arr)-1] == int32(65535) {
+		return true
+	}
 	for _, a := range arr {
 		if a == v {
 			return true
@@ -497,4 +582,128 @@ func contains(arr []int32, v int32) bool {
 	}
 
 	return false
+}
+
+func strContains(arr []string, v string) bool {
+	for _, a := range arr {
+		if a == v {
+			return true
+		}
+	}
+	return false
+}
+
+func addPort(arr []int32, v int32) []int32 {
+	if !contains(arr, v) {
+		arr = append(arr, v)
+	}
+	return arr
+}
+
+func addHost(arr []string, v string) []string {
+	if !strContains(arr, v) {
+		arr = append(arr, v)
+	}
+	return arr
+}
+
+type Node struct {
+	prev *Node
+	next *Node
+	rule NaclRule
+}
+
+func (L *NetworkAcl) Insert(rule NaclRule) {
+	list := &Node{
+		next: L.head,
+		rule: rule,
+	}
+	if L.head != nil {
+		L.head.prev = list
+	}
+	L.head = list
+
+	l := L.head
+	for l.next != nil {
+		l = l.next
+	}
+	L.tail = l
+}
+
+/*
+Iterate over each NACL rule in order
+
+Port can be explicitly allowed or denied
+If it's not covered, then move to the next rule
+*/
+func (l *NetworkAcl) Evaluate(port int32, proto string) (bool, *NaclRule) {
+	node := l.head
+	for node != nil {
+
+		// fmt.Printf("Checking if %d/%s is allowed in: \n", port, proto) // node.rule)
+
+		if contains(node.rule.PortRange, port) {
+			if val, ok := naclToSG[node.rule.Protocol]; ok {
+				if val == proto || val == "-1" || proto == "-1" {
+					return node.rule.Action, &node.rule
+				}
+			} else {
+				fmt.Printf("Protocol: %d not supported\n", node.rule.Protocol)
+			}
+
+		}
+
+		node = node.next
+	}
+	// If not covered by last node, then reject
+	return false, nil
+}
+
+func (l *NetworkAcl) Display() {
+	list := l.head
+	for list != nil {
+		fmt.Printf("%+v ->", list.rule)
+		list = list.next
+	}
+	fmt.Println()
+}
+
+// Assumes sorted list of input
+func prettyPorts(arr []int32) []string {
+	var ports []string
+
+	var first int32 = -1
+	var last int32 = -1
+	for i, v := range arr {
+		if i == 0 {
+			first = v
+		} else {
+			if last == -1 {
+				if first+int32(1) == v {
+					last = v
+				} else {
+					ports = append(ports, fmt.Sprintf("%d", first))
+					first = v
+					last = -1
+				}
+			} else if last != -1 && last+int32(1) == v {
+				last = v
+			} else {
+				// Add first-last to ports
+				ports = append(ports, fmt.Sprintf("%d-%d", first, last))
+
+				// Set new first to curr & set last to nil
+				first = v
+				last = -1
+			}
+		}
+	}
+
+	if last != -1 {
+		ports = append(ports, fmt.Sprintf("%d-%d", first, last))
+	} else if first != -1 {
+		ports = append(ports, fmt.Sprintf("%d", first))
+	}
+
+	return ports
 }
