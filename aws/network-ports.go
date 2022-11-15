@@ -35,6 +35,7 @@ type NetworkPortsModule struct {
 	OutputFormat string
 	Goroutines   int
 	AWSProfile   string
+	Verbosity    int
 
 	// Main module data
 	IPv4           []NetworkService
@@ -86,29 +87,15 @@ type SecurityGroupRule struct {
 	Ports    []int32
 }
 
-type ports []int32
-
-func (p ports) Len() int {
-	return len(p)
-}
-
-func (p ports) Less(i, j int) bool {
-	return p[i] < p[j]
-}
-
-func (p ports) Swap(i, j int) {
-	p[i], p[j] = p[j], p[i]
-}
-
 var naclToSG = map[string]string{
 	"-1": "-1",
 	"6":  "tcp",
 	"17": "udp",
 }
 
-func (m *NetworkPortsModule) PrintNetworkPorts(outputFormat string, outputDirectory string, verbosity int) {
+func (m *NetworkPortsModule) PrintNetworkPorts(outputFormat string, outputDirectory string) {
 	// These stuct values are used by the output module
-	m.output.Verbosity = verbosity
+	m.output.Verbosity = m.Verbosity
 	m.output.Directory = outputDirectory
 	m.output.CallingModule = "network-ports"
 	m.modLog = utils.TxtLog.WithFields(logrus.Fields{
@@ -192,8 +179,8 @@ func (m *NetworkPortsModule) PrintNetworkPorts(outputFormat string, outputDirect
 	if len(m.IPv4) > 0 || len(m.IPv6) > 0 {
 		m.output.FilePath = filepath.Join(outputDirectory, "cloudfox-output", "aws", m.AWSProfile)
 		//m.output.OutputSelector(outputFormat)
-		utils.OutputSelector(verbosity, outputFormat, m.output.Headers, m.output.Body, m.output.FilePath, m.output.CallingModule, m.output.CallingModule)
-		m.writeLoot(m.output.FilePath, verbosity, m.AWSProfile)
+		utils.OutputSelector(m.Verbosity, outputFormat, m.output.Headers, m.output.Body, m.output.FilePath, m.output.CallingModule, m.output.CallingModule)
+		m.writeLoot(m.output.FilePath)
 		fmt.Printf("[%s][%s] %s network services found.\n", cyan(m.output.CallingModule), cyan(m.AWSProfile), strconv.Itoa(len(m.output.Body)))
 
 	} else {
@@ -229,7 +216,7 @@ func (m *NetworkPortsModule) Receiver(receiver chan NetworkServices, receiverDon
 	}
 }
 
-func (m *NetworkPortsModule) writeLoot(outputDirectory string, verbosity int, profile string) {
+func (m *NetworkPortsModule) writeLoot(outputDirectory string) {
 	path := filepath.Join(outputDirectory, "loot")
 	err := os.MkdirAll(path, os.ModePerm)
 	if err != nil {
@@ -261,7 +248,7 @@ func (m *NetworkPortsModule) writeLoot(outputDirectory string, verbosity int, pr
 			m.modLog.Error(err.Error())
 		}
 
-		if verbosity > 2 {
+		if m.Verbosity > 2 {
 			fmt.Println()
 			fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), green("Use the commands below to manually inspect certain buckets of interest."))
 			fmt.Print(out)
@@ -298,7 +285,7 @@ func (m *NetworkPortsModule) writeLoot(outputDirectory string, verbosity int, pr
 			m.modLog.Error(err.Error())
 		}
 
-		if verbosity > 2 {
+		if m.Verbosity > 2 {
 			fmt.Println()
 			fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), green("Use the commands below to manually inspect certain buckets of interest."))
 			fmt.Print(out)
@@ -311,68 +298,56 @@ func (m *NetworkPortsModule) writeLoot(outputDirectory string, verbosity int, pr
 }
 
 func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver chan NetworkServices) {
-	fmt.Printf("Evaluating region: %s\n", r)
 	securityGroups := m.getEC2SecurityGroups(r)
 	nacls := m.getEC2NACLs(r)
 
 	for _, instance := range m.getEC2Instances(r) {
-		fmt.Printf("Instance: %s\n", aws.ToString(instance.InstanceId))
-		fmt.Printf("Network interfaces: %v\n", instance.NetworkInterfaces)
-		// TODO. Loop through NICs and grab IPs instead
 		var ipv4, ipv6 []string
 		for _, nic := range instance.NetworkInterfaces {
 			// ipv4
 			for _, addr := range nic.PrivateIpAddresses {
-				// Public
 				if addr.Association != nil {
 					if addr.Association.PublicIp != nil {
 						ipv4 = addHost(ipv4, aws.ToString(addr.Association.PublicIp))
 					}
 				}
 
-				// Private
 				if addr.PrivateIpAddress != nil {
 					ipv4 = addHost(ipv4, aws.ToString(addr.PrivateIpAddress))
 				}
 			}
 
-			// ipv6
 			for _, addr := range nic.Ipv6Addresses {
 				if addr.Ipv6Address != nil {
 					ipv6 = addHost(ipv6, aws.ToString(addr.Ipv6Address))
 				}
 			}
 		}
-		fmt.Printf("IPV4s: %v\n", ipv4)
-		fmt.Printf("IPV6s: %v\n", ipv6)
-		fmt.Printf("Security Groups: \n")
 		var groups []SecurityGroup
 		// Loop through the NICs as not all NIC SGs are added to instance.SecurityGroups
 		for _, nic := range instance.NetworkInterfaces {
 			for _, group := range nic.Groups {
 				for _, g := range securityGroups {
 					if aws.ToString(group.GroupId) == aws.ToString(g.GroupId) {
-						printSecurityGroup(g)
 						groups = append(groups, m.parseSecurityGroup(g))
 					}
 				}
 			}
 		}
-		fmt.Printf("Subnet ID: %s\n", aws.ToString(instance.SubnetId))
 		var networkAcls []NetworkAcl
 		for _, nacl := range nacls {
 			for _, assoc := range nacl.Associations {
 				if aws.ToString(instance.SubnetId) == aws.ToString(assoc.SubnetId) {
-					printNacl(nacl)
 					networkAcls = append(networkAcls, m.parseNacl(nacl))
 				}
 			}
 		}
-		fmt.Printf("Vpc ID: %s\n", aws.ToString(instance.VpcId))
 
 		tcpPorts, udpPorts := m.resolveNetworkAccess(groups, networkAcls)
 
-		fmt.Printf("Done analyzing rules!\nPrinting: %v\n", ipv4)
+		if m.Verbosity > 0 {
+			fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("Instance: %s, TCP Ports: %v, UDP Ports: %v", aws.ToString(instance.InstanceId), tcpPorts, udpPorts))
+		}
 
 		var networkServices NetworkServices
 
@@ -430,11 +405,6 @@ func (m *NetworkPortsModule) getEC2SecurityGroups(region string) []types.Securit
 		}
 	}
 
-	// fmt.Printf("Security groups are %v\n", securityGroups)
-	for _, group := range securityGroups {
-		printSecurityGroup(group)
-	}
-
 	return securityGroups
 }
 
@@ -449,8 +419,6 @@ func (m *NetworkPortsModule) parseSecurityGroup(group types.SecurityGroup) Secur
 			cidrs = append(cidrs, aws.ToString(i.CidrIp))
 		}
 		var ports []int32
-		fmt.Printf("From is %d\n", aws.ToInt32(entry.FromPort))
-		fmt.Printf("To is %d\n", aws.ToInt32(entry.ToPort))
 		if aws.ToInt32(entry.FromPort) == int32(0) && aws.ToInt32(entry.ToPort) == int32(0) {
 			ports = generateRange(0, 65535)
 		} else {
@@ -470,23 +438,23 @@ func (m *NetworkPortsModule) parseSecurityGroup(group types.SecurityGroup) Secur
 	}
 }
 
-func printSecurityGroup(group types.SecurityGroup) {
-	fmt.Printf("ID: %s\n", aws.ToString(group.GroupId))
-	fmt.Printf("Vpc ID: %s\n", aws.ToString(group.VpcId))
-	for _, entry := range group.IpPermissions {
-		fmt.Printf("\tProtocol: %s\n", aws.ToString(entry.IpProtocol))
-		var ips []string
-		for _, i := range entry.IpRanges {
-			ips = append(ips, aws.ToString(i.CidrIp))
-		}
-		fmt.Printf("\tIP Ranges: %v\n", ips)
-		if aws.ToInt32(entry.FromPort) == int32(0) && aws.ToInt32(entry.ToPort) == int32(0) {
-			fmt.Printf("\tPortRange: %d - %d\n", 0, 65535)
-		} else {
-			fmt.Printf("\tPortRange: %d - %d\n", aws.ToInt32(entry.FromPort), aws.ToInt32(entry.ToPort))
-		}
-	}
-}
+// func printSecurityGroup(group types.SecurityGroup) {
+// 	fmt.Printf("ID: %s\n", aws.ToString(group.GroupId))
+// 	fmt.Printf("Vpc ID: %s\n", aws.ToString(group.VpcId))
+// 	for _, entry := range group.IpPermissions {
+// 		fmt.Printf("\tProtocol: %s\n", aws.ToString(entry.IpProtocol))
+// 		var ips []string
+// 		for _, i := range entry.IpRanges {
+// 			ips = append(ips, aws.ToString(i.CidrIp))
+// 		}
+// 		fmt.Printf("\tIP Ranges: %v\n", ips)
+// 		if aws.ToInt32(entry.FromPort) == int32(0) && aws.ToInt32(entry.ToPort) == int32(0) {
+// 			fmt.Printf("\tPortRange: %d - %d\n", 0, 65535)
+// 		} else {
+// 			fmt.Printf("\tPortRange: %d - %d\n", aws.ToInt32(entry.FromPort), aws.ToInt32(entry.ToPort))
+// 		}
+// 	}
+// }
 
 func (m *NetworkPortsModule) getEC2NACLs(region string) []types.NetworkAcl {
 	var nacls []types.NetworkAcl
@@ -516,10 +484,6 @@ func (m *NetworkPortsModule) getEC2NACLs(region string) []types.NetworkAcl {
 			PaginationControl = nil
 			break
 		}
-	}
-
-	for _, nacl := range nacls {
-		printNacl(nacl)
 	}
 
 	return nacls
@@ -575,28 +539,28 @@ func (m *NetworkPortsModule) parseNacl(nacl types.NetworkAcl) NetworkAcl {
 	return naclList
 }
 
-func printNacl(nacl types.NetworkAcl) {
-	fmt.Printf("ID: %s\n", aws.ToString(nacl.NetworkAclId))
-	fmt.Printf("Vpc ID: %s\n", aws.ToString(nacl.VpcId))
-	var subnets []string
-	for _, assoc := range nacl.Associations {
-		subnets = append(subnets, aws.ToString(assoc.SubnetId))
-	}
-	fmt.Printf("Associations: %v\n", subnets)
-	for _, entry := range nacl.Entries {
-		fmt.Printf("\tRuleNumber: %d\n", aws.ToInt32(entry.RuleNumber))
-		fmt.Printf("\tProtocol: %s\n", aws.ToString(entry.Protocol))
-		fmt.Printf("\tCIDR: %s\n", aws.ToString(entry.CidrBlock))
-		fmt.Printf("\tEgress: %t\n", aws.ToBool(entry.Egress))
-		if entry.PortRange == nil {
-			fmt.Printf("\tPortRange: all\n")
-		} else {
-			var ports types.PortRange = *entry.PortRange
-			fmt.Printf("\tPortRange: %d - %d\n", aws.ToInt32(ports.From), aws.ToInt32(ports.To))
-		}
-		fmt.Printf("\tRuleAction: %s\n", entry.RuleAction)
-	}
-}
+// func printNacl(nacl types.NetworkAcl) {
+// 	fmt.Printf("ID: %s\n", aws.ToString(nacl.NetworkAclId))
+// 	fmt.Printf("Vpc ID: %s\n", aws.ToString(nacl.VpcId))
+// 	var subnets []string
+// 	for _, assoc := range nacl.Associations {
+// 		subnets = append(subnets, aws.ToString(assoc.SubnetId))
+// 	}
+// 	fmt.Printf("Associations: %v\n", subnets)
+// 	for _, entry := range nacl.Entries {
+// 		fmt.Printf("\tRuleNumber: %d\n", aws.ToInt32(entry.RuleNumber))
+// 		fmt.Printf("\tProtocol: %s\n", aws.ToString(entry.Protocol))
+// 		fmt.Printf("\tCIDR: %s\n", aws.ToString(entry.CidrBlock))
+// 		fmt.Printf("\tEgress: %t\n", aws.ToBool(entry.Egress))
+// 		if entry.PortRange == nil {
+// 			fmt.Printf("\tPortRange: all\n")
+// 		} else {
+// 			var ports types.PortRange = *entry.PortRange
+// 			fmt.Printf("\tPortRange: %d - %d\n", aws.ToInt32(ports.From), aws.ToInt32(ports.To))
+// 		}
+// 		fmt.Printf("\tRuleAction: %s\n", entry.RuleAction)
+// 	}
+// }
 
 func (m *NetworkPortsModule) getEC2Instances(region string) []types.Instance {
 	var instances []types.Instance
@@ -636,12 +600,6 @@ func (m *NetworkPortsModule) getEC2Instances(region string) []types.Instance {
 }
 
 func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) ([]string, []string) {
-	// fmt.Printf("%v\n", nacls)
-
-	// SGs allow access to ports
-
-	// NACLs restrict or allow
-
 	/*
 		// Loop through each security group
 			// Loop through the rules for the security group
@@ -652,8 +610,8 @@ func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls 
 
 	*/
 
-	var udpPorts ports
-	var tcpPorts ports
+	var udpPorts []int32
+	var tcpPorts []int32
 
 	for _, group := range groups {
 		for _, rule := range group.Rules {
@@ -675,10 +633,13 @@ func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls 
 		}
 	}
 
-	sort.Sort(tcpPorts)
-	sort.Sort(udpPorts)
-	fmt.Printf("TCP Ports are %v\n", prettyPorts(tcpPorts))
-	fmt.Printf("UDP Ports are %v\n", prettyPorts(udpPorts))
+	sort.Slice(tcpPorts, func(i, j int) bool {
+		return tcpPorts[i] < tcpPorts[j]
+	})
+
+	sort.Slice(udpPorts, func(i, j int) bool {
+		return udpPorts[i] < udpPorts[j]
+	})
 
 	return prettyPorts(tcpPorts), prettyPorts(udpPorts)
 }
@@ -692,6 +653,7 @@ func generateRange(start int32, end int32) []int32 {
 }
 
 func contains(arr []int32, v int32) bool {
+	// Quick eval for all-ports
 	if len(arr) == 65536 && arr[0] == int32(0) && arr[len(arr)-1] == int32(65535) {
 		return true
 	}
@@ -750,12 +712,6 @@ func (L *NetworkAcl) Insert(rule NaclRule) {
 	L.tail = l
 }
 
-/*
-Iterate over each NACL rule in order
-
-Port can be explicitly allowed or denied
-If it's not covered, then move to the next rule
-*/
 func (l *NetworkAcl) Evaluate(port int32, proto string) (bool, *NaclRule) {
 	node := l.head
 	for node != nil {
@@ -775,17 +731,8 @@ func (l *NetworkAcl) Evaluate(port int32, proto string) (bool, *NaclRule) {
 
 		node = node.next
 	}
-	// If not covered by last node, then reject
-	return false, nil
-}
 
-func (l *NetworkAcl) Display() {
-	list := l.head
-	for list != nil {
-		fmt.Printf("%+v ->", list.rule)
-		list = list.next
-	}
-	fmt.Println()
+	return false, nil
 }
 
 // Assumes sorted list of input
@@ -809,10 +756,8 @@ func prettyPorts(arr []int32) []string {
 			} else if last != -1 && last+int32(1) == v {
 				last = v
 			} else {
-				// Add first-last to ports
 				ports = append(ports, fmt.Sprintf("%d-%d", first, last))
 
-				// Set new first to curr & set last to nil
 				first = v
 				last = -1
 			}

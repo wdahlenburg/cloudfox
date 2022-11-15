@@ -524,8 +524,9 @@ var (
 					AWSRegions: AWSRegions,
 					AWSProfile: profile,
 					Goroutines: Goroutines,
+					Verbosity:  Verbosity,
 				}
-				m.PrintNetworkPorts(AWSOutputFormat, AWSOutputDirectory, Verbosity)
+				m.PrintNetworkPorts(AWSOutputFormat, AWSOutputDirectory)
 			}
 		},
 	}
@@ -1062,7 +1063,7 @@ var (
 					Goroutines: Goroutines,
 					AWSRegions: AWSRegions,
 				}
-				networkPorts.PrintNetworkPorts(AWSOutputFormat, AWSOutputDirectory, Verbosity)
+				networkPorts.PrintNetworkPorts(AWSOutputFormat, AWSOutputDirectory)
 
 				// IAM privesc section
 				fmt.Printf("[%s] %s\n", cyan(emoji.Sprintf(":fox:cloudfox :fox:")), green("IAM is complicated. Complicated usually means misconfigurations. You'll want to pay attention here."))
