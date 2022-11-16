@@ -301,78 +301,88 @@ func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver 
 	securityGroups := m.getEC2SecurityGroups(r)
 	nacls := m.getEC2NACLs(r)
 
-	for _, instance := range m.getEC2Instances(r) {
-		var ipv4, ipv6 []string
-		for _, nic := range instance.NetworkInterfaces {
-			// ipv4
-			for _, addr := range nic.PrivateIpAddresses {
-				if addr.Association != nil {
-					if addr.Association.PublicIp != nil {
-						ipv4 = addHost(ipv4, aws.ToString(addr.Association.PublicIp))
+	instances := m.getEC2Instances(r)
+
+	var wg sync.WaitGroup
+	wg.Add(len(instances))
+
+	for _, instance := range instances {
+		go func(instance types.Instance) {
+			defer wg.Done()
+
+			var ipv4, ipv6 []string
+			for _, nic := range instance.NetworkInterfaces {
+				// ipv4
+				for _, addr := range nic.PrivateIpAddresses {
+					if addr.Association != nil {
+						if addr.Association.PublicIp != nil {
+							ipv4 = addHost(ipv4, aws.ToString(addr.Association.PublicIp))
+						}
+					}
+
+					if addr.PrivateIpAddress != nil {
+						ipv4 = addHost(ipv4, aws.ToString(addr.PrivateIpAddress))
 					}
 				}
 
-				if addr.PrivateIpAddress != nil {
-					ipv4 = addHost(ipv4, aws.ToString(addr.PrivateIpAddress))
-				}
-			}
-
-			for _, addr := range nic.Ipv6Addresses {
-				if addr.Ipv6Address != nil {
-					ipv6 = addHost(ipv6, aws.ToString(addr.Ipv6Address))
-				}
-			}
-		}
-		var groups []SecurityGroup
-		// Loop through the NICs as not all NIC SGs are added to instance.SecurityGroups
-		for _, nic := range instance.NetworkInterfaces {
-			for _, group := range nic.Groups {
-				for _, g := range securityGroups {
-					if aws.ToString(group.GroupId) == aws.ToString(g.GroupId) {
-						groups = append(groups, m.parseSecurityGroup(g))
+				for _, addr := range nic.Ipv6Addresses {
+					if addr.Ipv6Address != nil {
+						ipv6 = addHost(ipv6, aws.ToString(addr.Ipv6Address))
 					}
 				}
 			}
-		}
-		var networkAcls []NetworkAcl
-		for _, nacl := range nacls {
-			for _, assoc := range nacl.Associations {
-				if aws.ToString(instance.SubnetId) == aws.ToString(assoc.SubnetId) {
-					networkAcls = append(networkAcls, m.parseNacl(nacl))
+			var groups []SecurityGroup
+			// Loop through the NICs as not all NIC SGs are added to instance.SecurityGroups
+			for _, nic := range instance.NetworkInterfaces {
+				for _, group := range nic.Groups {
+					for _, g := range securityGroups {
+						if aws.ToString(group.GroupId) == aws.ToString(g.GroupId) {
+							groups = append(groups, m.parseSecurityGroup(g))
+						}
+					}
 				}
 			}
-		}
-
-		tcpPorts, udpPorts := m.resolveNetworkAccess(groups, networkAcls)
-
-		if m.Verbosity > 0 {
-			fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("Instance: %s, TCP Ports: %v, UDP Ports: %v", aws.ToString(instance.InstanceId), tcpPorts, udpPorts))
-		}
-
-		var networkServices NetworkServices
-
-		// IPV4
-		if len(ipv4) > 0 {
-
-			if len(tcpPorts) > 0 {
-				networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4, Ports: tcpPorts, Protocol: "tcp"})
+			var networkAcls []NetworkAcl
+			for _, nacl := range nacls {
+				for _, assoc := range nacl.Associations {
+					if aws.ToString(instance.SubnetId) == aws.ToString(assoc.SubnetId) {
+						networkAcls = append(networkAcls, m.parseNacl(nacl))
+					}
+				}
 			}
-			if len(udpPorts) > 0 {
-				networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4, Ports: udpPorts, Protocol: "udp"})
-			}
-		}
 
-		// IPV6
-		if len(ipv6) > 0 {
-			if len(tcpPorts) > 0 {
-				networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv6, Ports: tcpPorts, Protocol: "tcp"})
+			tcpPorts, udpPorts := m.resolveNetworkAccess(groups, networkAcls)
+
+			if m.Verbosity > 0 {
+				fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("Instance: %s, TCP Ports: %v, UDP Ports: %v", aws.ToString(instance.InstanceId), tcpPorts, udpPorts))
 			}
-			if len(udpPorts) > 0 {
-				networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv6, Ports: udpPorts, Protocol: "udp"})
+
+			var networkServices NetworkServices
+
+			// IPV4
+			if len(ipv4) > 0 {
+
+				if len(tcpPorts) > 0 {
+					networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4, Ports: tcpPorts, Protocol: "tcp"})
+				}
+				if len(udpPorts) > 0 {
+					networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4, Ports: udpPorts, Protocol: "udp"})
+				}
 			}
-		}
-		dataReceiver <- networkServices
+
+			// IPV6
+			if len(ipv6) > 0 {
+				if len(tcpPorts) > 0 {
+					networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv6, Ports: tcpPorts, Protocol: "tcp"})
+				}
+				if len(udpPorts) > 0 {
+					networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv6, Ports: udpPorts, Protocol: "udp"})
+				}
+			}
+			dataReceiver <- networkServices
+		}(instance)
 	}
+	wg.Wait()
 }
 
 func (m *NetworkPortsModule) getEC2SecurityGroups(region string) []types.SecurityGroup {
