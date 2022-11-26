@@ -15,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/rds"
+	rds_types "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/sirupsen/logrus"
 )
@@ -29,6 +31,7 @@ var (
 type NetworkPortsModule struct {
 	// General configuration data
 	EC2Client *ec2.Client
+	RDSClient *rds.Client
 
 	Caller       sts.GetCallerIdentityOutput
 	AWSRegions   []string
@@ -195,6 +198,9 @@ func (m *NetworkPortsModule) executeChecks(r string, wg *sync.WaitGroup, dataRec
 	m.CommandCounter.Executing++
 	m.getEC2NetworkPortsPerRegion(r, dataReceiver)
 	m.CommandCounter.Executing--
+	m.CommandCounter.Executing++
+	m.getRdsServicesPerRegion(r, dataReceiver)
+	m.CommandCounter.Executing--
 	m.CommandCounter.Complete++
 }
 
@@ -351,7 +357,9 @@ func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver 
 				}
 			}
 
-			tcpPorts, udpPorts := m.resolveNetworkAccess(groups, networkAcls)
+			tcpPortsInts, udpPortsInts := m.resolveNetworkAccess(groups, networkAcls)
+			tcpPorts := prettyPorts(tcpPortsInts)
+			udpPorts := prettyPorts(udpPortsInts)
 
 			if m.Verbosity > 0 {
 				fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("Instance: %s, TCP Ports: %v, UDP Ports: %v", aws.ToString(instance.InstanceId), tcpPorts, udpPorts))
@@ -416,6 +424,76 @@ func (m *NetworkPortsModule) getEC2SecurityGroups(region string) []types.Securit
 	}
 
 	return securityGroups
+}
+
+func (m *NetworkPortsModule) getRdsServicesPerRegion(r string, dataReceiver chan NetworkServices) {
+	securityGroups := m.getEC2SecurityGroups(r)
+	nacls := m.getEC2NACLs(r)
+
+	DBInstances := m.getRdsInstancesPerRegion(r)
+	RDSClusters := m.getRDSClustersPerRegion(r)
+
+	var reportedClusters []string
+
+	for _, instance := range DBInstances {
+		if aws.ToString(instance.DBInstanceStatus) == "available" {
+			host := []string{aws.ToString(instance.Endpoint.Address)}
+			var port int32 = instance.Endpoint.Port
+
+			var groups []SecurityGroup
+			for _, group := range instance.VpcSecurityGroups {
+				for _, g := range securityGroups {
+					if aws.ToString(group.VpcSecurityGroupId) == aws.ToString(g.GroupId) {
+						groups = append(groups, m.parseSecurityGroup(g))
+					}
+				}
+			}
+
+			var networkAcls []NetworkAcl
+			if instance.DBSubnetGroup != nil {
+				for _, subnet := range instance.DBSubnetGroup.Subnets {
+					for _, nacl := range nacls {
+						for _, assoc := range nacl.Associations {
+							if aws.ToString(subnet.SubnetIdentifier) == aws.ToString(assoc.SubnetId) {
+								networkAcls = append(networkAcls, m.parseNacl(nacl))
+							}
+						}
+					}
+				}
+			}
+
+			tcpPorts, _ := m.resolveNetworkAccess(groups, networkAcls)
+			var networkServices NetworkServices
+			if contains(tcpPorts, port) {
+				if m.Verbosity > 0 {
+					fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("DB Instance: %s, TCP Ports: %d", aws.ToString(instance.Endpoint.Address), port))
+				}
+				networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "RDS", Region: r, Hosts: host, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
+
+				// Check clusters
+				if aws.ToString(instance.DBClusterIdentifier) != "" {
+					clusterId := aws.ToString(instance.DBClusterIdentifier)
+					if !strContains(reportedClusters, clusterId) {
+						for _, cluster := range RDSClusters {
+							if aws.ToString(cluster.DBClusterIdentifier) == clusterId {
+								if m.Verbosity > 0 {
+									fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("DB Instance: %s, TCP Ports: %d", aws.ToString(cluster.Endpoint), port))
+									fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("DB Instance: %s, TCP Ports: %d", aws.ToString(cluster.ReaderEndpoint), port))
+								}
+								networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "RDS", Region: r, Hosts: []string{aws.ToString(cluster.Endpoint)}, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
+								networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "RDS", Region: r, Hosts: []string{aws.ToString(cluster.ReaderEndpoint)}, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
+
+								// Add the clusterId to the reported clusters
+								reportedClusters = append(reportedClusters, clusterId)
+							}
+						}
+					}
+				}
+			}
+
+			dataReceiver <- networkServices
+		}
+	}
 }
 
 func (m *NetworkPortsModule) parseSecurityGroup(group types.SecurityGroup) SecurityGroup {
@@ -609,7 +687,81 @@ func (m *NetworkPortsModule) getEC2Instances(region string) []types.Instance {
 	return instances
 }
 
-func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) ([]string, []string) {
+func (m *NetworkPortsModule) getRdsInstancesPerRegion(region string) []rds_types.DBInstance {
+	// "PaginationMarker" is a control variable used for output continuity, as AWS return the output in pages.
+	var PaginationControl *string
+	var instances []rds_types.DBInstance
+	for {
+		DescribeDBInstances, err := m.RDSClient.DescribeDBInstances(
+			context.TODO(),
+			&(rds.DescribeDBInstancesInput{
+				Marker: PaginationControl,
+			}),
+			func(o *rds.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			// if errors.As(err, &oe) {
+			// m.Errors = append(m.Errors, (fmt.Sprintf("Error: Region: %s", region)))
+			// }
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, instance := range DescribeDBInstances.DBInstances {
+			instances = append(instances, instance)
+		}
+
+		// The "NextToken" value is nil when there's no more data to return.
+		if DescribeDBInstances.Marker != nil {
+			PaginationControl = DescribeDBInstances.Marker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+
+	return instances
+}
+
+func (m *NetworkPortsModule) getRDSClustersPerRegion(region string) []rds_types.DBCluster {
+	var PaginationControl *string
+	var clusters []rds_types.DBCluster
+	for {
+		DescribeDBClusters, err := m.RDSClient.DescribeDBClusters(
+			context.TODO(),
+			&(rds.DescribeDBClustersInput{
+				Marker: PaginationControl,
+			}),
+			func(o *rds.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, cluster := range DescribeDBClusters.DBClusters {
+			clusters = append(clusters, cluster)
+		}
+
+		// The "NextToken" value is nil when there's no more data to return.
+		if DescribeDBClusters.Marker != nil {
+			PaginationControl = DescribeDBClusters.Marker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+
+	return clusters
+}
+
+func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) ([]int32, []int32) {
 	/*
 		// Loop through each security group
 			// Loop through the rules for the security group
@@ -651,7 +803,7 @@ func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls 
 		return udpPorts[i] < udpPorts[j]
 	})
 
-	return prettyPorts(tcpPorts), prettyPorts(udpPorts)
+	return tcpPorts, udpPorts
 }
 
 func generateRange(start int32, end int32) []int32 {

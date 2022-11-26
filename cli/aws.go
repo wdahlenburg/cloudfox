@@ -520,6 +520,7 @@ var (
 				}
 				m := aws.NetworkPortsModule{
 					EC2Client:  ec2.NewFromConfig(AWSConfig),
+					RDSClient:  rds.NewFromConfig(AWSConfig),
 					Caller:     *caller,
 					AWSRegions: AWSRegions,
 					AWSProfile: profile,
@@ -1058,6 +1059,7 @@ var (
 
 				networkPorts := aws.NetworkPortsModule{
 					EC2Client:  ec2Client,
+					RDSClient:  rdsClient,
 					Caller:     *Caller,
 					AWSProfile: profile,
 					Goroutines: Goroutines,
