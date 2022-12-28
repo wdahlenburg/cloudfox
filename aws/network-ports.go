@@ -26,6 +26,19 @@ var (
 	UDP_4_SCAN string = "sudo nmap -sU -sV"
 	TCP_6_SCAN string = "sudo nmap -6 -sV"
 	UDP_6_SCAN string = "sudo nmap -6 -sU -sV"
+
+	IPv4_BANNER string = `#############################################
+# The network services may have various ingress rules depending on your source IP.
+# Try scanning from any or all network locations, such as within a VPC.
+#############################################
+`
+
+	IPv6_BANNER string = `#############################################
+# The network services may have various ingress rules depending on your source IP.
+# Try scanning from any or all network locations, such as within a VPC.
+# Make sure the host you scan IPv6 from has an IPv6 network interface.
+#############################################
+`
 )
 
 type NetworkPortsModule struct {
@@ -41,7 +54,8 @@ type NetworkPortsModule struct {
 	Verbosity    int
 
 	// Main module data
-	IPv4           []NetworkService
+	IPv4_Private   []NetworkService
+	IPv4_Public    []NetworkService
 	IPv6           []NetworkService
 	CommandCounter console.CommandCounter
 	// Used to store output data for pretty printing
@@ -50,8 +64,9 @@ type NetworkPortsModule struct {
 }
 
 type NetworkServices struct {
-	IPv4 []NetworkService
-	IPv6 []NetworkService
+	IPv4_Private []NetworkService
+	IPv4_Public  []NetworkService
+	IPv6         []NetworkService
 }
 
 type NetworkService struct {
@@ -144,42 +159,29 @@ func (m *NetworkPortsModule) PrintNetworkPorts(outputFormat string, outputDirect
 		"Service",
 		"Region",
 		"Protocol",
-		"IP",
+		"Host",
 		"Ports",
 	}
 
 	// Table rows
-	for _, i := range m.IPv4 {
-		for _, h := range i.Hosts {
-			m.output.Body = append(
-				m.output.Body,
-				[]string{
-					i.AWSService,
-					i.Region,
-					i.Protocol,
-					h,
-					strings.Join(i.Ports, ","),
-				},
-			)
+	for _, arr := range [][]NetworkService{m.IPv4_Private, m.IPv4_Public, m.IPv6} {
+		for _, i := range arr {
+			for _, h := range i.Hosts {
+				m.output.Body = append(
+					m.output.Body,
+					[]string{
+						i.AWSService,
+						i.Region,
+						i.Protocol,
+						h,
+						strings.Join(i.Ports, ","),
+					},
+				)
+			}
 		}
 	}
 
-	for _, i := range m.IPv6 {
-		for _, h := range i.Hosts {
-			m.output.Body = append(
-				m.output.Body,
-				[]string{
-					i.AWSService,
-					i.Region,
-					i.Protocol,
-					h,
-					strings.Join(i.Ports, ","),
-				},
-			)
-		}
-	}
-
-	if len(m.IPv4) > 0 || len(m.IPv6) > 0 {
+	if len(m.IPv4_Private) > 0 || len(m.IPv4_Public) > 0 || len(m.IPv6) > 0 {
 		m.output.FilePath = filepath.Join(outputDirectory, "cloudfox-output", "aws", m.AWSProfile)
 		//m.output.OutputSelector(outputFormat)
 		utils.OutputSelector(m.Verbosity, outputFormat, m.output.Headers, m.output.Body, m.output.FilePath, m.output.CallingModule, m.output.CallingModule)
@@ -209,8 +211,11 @@ func (m *NetworkPortsModule) Receiver(receiver chan NetworkServices, receiverDon
 	for {
 		select {
 		case data := <-receiver:
-			if len(data.IPv4) != 0 {
-				m.IPv4 = append(m.IPv4, data.IPv4...)
+			if len(data.IPv4_Private) != 0 {
+				m.IPv4_Private = append(m.IPv4_Private, data.IPv4_Private...)
+			}
+			if len(data.IPv4_Public) != 0 {
+				m.IPv4_Public = append(m.IPv4_Public, data.IPv4_Public...)
 			}
 			if len(data.IPv6) != 0 {
 				m.IPv6 = append(m.IPv6, data.IPv6...)
@@ -229,78 +234,56 @@ func (m *NetworkPortsModule) writeLoot(outputDirectory string) {
 		m.modLog.Error(err.Error())
 	}
 
-	if len(m.IPv4) > 0 {
-		ipv4Filename := filepath.Join(path, "network-ports-ipv4.txt")
+	if len(m.IPv4_Private) > 0 {
+		ipv4Filename := filepath.Join(path, "network-ports-private-ipv4.txt")
+		m.writeLootFile(ipv4Filename, IPv4_BANNER, true, m.IPv4_Private)
+	}
 
-		var out string
-		out = fmt.Sprintln("#############################################")
-		out = out + fmt.Sprintln("# The network services may have various ingress rules depending on your source IP.")
-		out = out + fmt.Sprintln("# Try scanning from any or all network locations, such as within a VPC.")
-		out = out + fmt.Sprintln("#############################################")
-		out = out + fmt.Sprintln("")
-
-		for _, ipv4 := range m.IPv4 {
-			if ipv4.Protocol == "tcp" {
-				out = out + fmt.Sprintf("%s -p %s %s\n", TCP_4_SCAN, strings.Join(ipv4.Ports, ","), strings.Join(ipv4.Hosts, " "))
-			}
-
-			if ipv4.Protocol == "udp" {
-				out = out + fmt.Sprintf("%s -p %s %s\n", UDP_4_SCAN, strings.Join(ipv4.Ports, ","), strings.Join(ipv4.Hosts, " "))
-			}
-		}
-
-		err = os.WriteFile(ipv4Filename, []byte(out), 0644)
-		if err != nil {
-			m.modLog.Error(err.Error())
-		}
-
-		if m.Verbosity > 2 {
-			fmt.Println()
-			fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), green("Use the commands below to manually inspect certain buckets of interest."))
-			fmt.Print(out)
-			fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), green("End of loot file."))
-		}
-
-		fmt.Printf("[%s][%s] Loot written to [%s]\n", cyan(m.output.CallingModule), cyan(m.AWSProfile), ipv4Filename)
+	if len(m.IPv4_Public) > 0 {
+		ipv4Filename := filepath.Join(path, "network-ports-public-ipv4.txt")
+		m.writeLootFile(ipv4Filename, IPv4_BANNER, true, m.IPv4_Public)
 	}
 
 	if len(m.IPv6) > 0 {
-		ipv6Filename := filepath.Join(path, "network-ports-ipv6.txt")
+		ipv4Filename := filepath.Join(path, "network-ports-public-ipv6.txt")
+		m.writeLootFile(ipv4Filename, IPv6_BANNER, false, m.IPv6)
+	}
+}
 
-		var out string
-		out = fmt.Sprintln("#############################################")
-		out = out + fmt.Sprintln("# The network services may have various ingress rules depending on your source IP.")
-		out = out + fmt.Sprintln("# Try scanning from any or all network locations, such as within a VPC.")
-		out = out + fmt.Sprintln("# Make sure the host you scan IPv6 from has an IPv6 network interface.")
-		out = out + fmt.Sprintln("#############################################")
-		out = out + fmt.Sprintln("")
+func (m *NetworkPortsModule) writeLootFile(filename string, bannner string, ipv4 bool, services []NetworkService) {
+	out := bannner
 
-		for _, ipv6 := range m.IPv6 {
-
-			if ipv6.Protocol == "tcp" {
-				out = out + fmt.Sprintf("%s -p %s %s\n", TCP_6_SCAN, strings.Join(ipv6.Ports, ","), strings.Join(ipv6.Hosts, " "))
-			}
-
-			if ipv6.Protocol == "udp" {
-				out = out + fmt.Sprintf("%s -p %s %s\n", UDP_6_SCAN, strings.Join(ipv6.Ports, ","), strings.Join(ipv6.Hosts, " "))
+	for _, service := range services {
+		if service.Protocol == "tcp" {
+			if ipv4 {
+				out = out + fmt.Sprintf("%s -p %s %s\n", TCP_4_SCAN, strings.Join(service.Ports, ","), strings.Join(service.Hosts, " "))
+			} else {
+				out = out + fmt.Sprintf("%s -p %s %s\n", TCP_6_SCAN, strings.Join(service.Ports, ","), strings.Join(service.Hosts, " "))
 			}
 		}
 
-		err = os.WriteFile(ipv6Filename, []byte(out), 0644)
-		if err != nil {
-			m.modLog.Error(err.Error())
+		if service.Protocol == "udp" {
+			if ipv4 {
+				out = out + fmt.Sprintf("%s -p %s %s\n", UDP_4_SCAN, strings.Join(service.Ports, ","), strings.Join(service.Hosts, " "))
+			} else {
+				out = out + fmt.Sprintf("%s -p %s %s\n", UDP_6_SCAN, strings.Join(service.Ports, ","), strings.Join(service.Hosts, " "))
+			}
 		}
-
-		if m.Verbosity > 2 {
-			fmt.Println()
-			fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), green("Use the commands below to manually inspect certain buckets of interest."))
-			fmt.Print(out)
-			fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), green("End of loot file."))
-		}
-
-		fmt.Printf("[%s][%s] Loot written to [%s]\n", cyan(m.output.CallingModule), cyan(m.AWSProfile), ipv6Filename)
 	}
 
+	err := os.WriteFile(filename, []byte(out), 0644)
+	if err != nil {
+		m.modLog.Error(err.Error())
+	}
+
+	if m.Verbosity > 2 {
+		fmt.Println()
+		fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), green("Use the commands below to manually inspect certain buckets of interest."))
+		fmt.Print(out)
+		fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), green("End of loot file."))
+	}
+
+	fmt.Printf("[%s][%s] Loot written to [%s]\n", cyan(m.output.CallingModule), cyan(m.AWSProfile), filename)
 }
 
 func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver chan NetworkServices) {
@@ -316,18 +299,18 @@ func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver 
 		go func(instance types.Instance) {
 			defer wg.Done()
 
-			var ipv4, ipv6 []string
+			var ipv4_private, ipv4_public, ipv6 []string
 			for _, nic := range instance.NetworkInterfaces {
 				// ipv4
 				for _, addr := range nic.PrivateIpAddresses {
 					if addr.Association != nil {
 						if addr.Association.PublicIp != nil {
-							ipv4 = addHost(ipv4, aws.ToString(addr.Association.PublicIp))
+							ipv4_public = addHost(ipv4_public, aws.ToString(addr.Association.PublicIp))
 						}
 					}
 
 					if addr.PrivateIpAddress != nil {
-						ipv4 = addHost(ipv4, aws.ToString(addr.PrivateIpAddress))
+						ipv4_private = addHost(ipv4_private, aws.ToString(addr.PrivateIpAddress))
 					}
 				}
 
@@ -368,13 +351,23 @@ func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver 
 			var networkServices NetworkServices
 
 			// IPV4
-			if len(ipv4) > 0 {
+			if len(ipv4_private) > 0 {
 
 				if len(tcpPorts) > 0 {
-					networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4, Ports: tcpPorts, Protocol: "tcp"})
+					networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4_private, Ports: tcpPorts, Protocol: "tcp"})
 				}
 				if len(udpPorts) > 0 {
-					networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4, Ports: udpPorts, Protocol: "udp"})
+					networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4_private, Ports: udpPorts, Protocol: "udp"})
+				}
+			}
+
+			if len(ipv4_public) > 0 {
+
+				if len(tcpPorts) > 0 {
+					networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4_public, Ports: tcpPorts, Protocol: "tcp"})
+				}
+				if len(udpPorts) > 0 {
+					networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "EC2", Region: r, Hosts: ipv4_public, Ports: udpPorts, Protocol: "udp"})
 				}
 			}
 
@@ -468,7 +461,7 @@ func (m *NetworkPortsModule) getRdsServicesPerRegion(r string, dataReceiver chan
 				if m.Verbosity > 0 {
 					fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("DB Instance: %s, TCP Ports: %d", aws.ToString(instance.Endpoint.Address), port))
 				}
-				networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "RDS", Region: r, Hosts: host, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
+				networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "RDS", Region: r, Hosts: host, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
 
 				// Check clusters
 				if aws.ToString(instance.DBClusterIdentifier) != "" {
@@ -480,8 +473,8 @@ func (m *NetworkPortsModule) getRdsServicesPerRegion(r string, dataReceiver chan
 									fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("DB Instance: %s, TCP Ports: %d", aws.ToString(cluster.Endpoint), port))
 									fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("DB Instance: %s, TCP Ports: %d", aws.ToString(cluster.ReaderEndpoint), port))
 								}
-								networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "RDS", Region: r, Hosts: []string{aws.ToString(cluster.Endpoint)}, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
-								networkServices.IPv4 = append(networkServices.IPv4, NetworkService{AWSService: "RDS", Region: r, Hosts: []string{aws.ToString(cluster.ReaderEndpoint)}, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
+								networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "RDS", Region: r, Hosts: []string{aws.ToString(cluster.Endpoint)}, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
+								networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "RDS", Region: r, Hosts: []string{aws.ToString(cluster.ReaderEndpoint)}, Ports: []string{fmt.Sprintf("%d", port)}, Protocol: "tcp"})
 
 								// Add the clusterId to the reported clusters
 								reportedClusters = append(reportedClusters, clusterId)
@@ -525,24 +518,6 @@ func (m *NetworkPortsModule) parseSecurityGroup(group types.SecurityGroup) Secur
 		Rules: rules,
 	}
 }
-
-// func printSecurityGroup(group types.SecurityGroup) {
-// 	fmt.Printf("ID: %s\n", aws.ToString(group.GroupId))
-// 	fmt.Printf("Vpc ID: %s\n", aws.ToString(group.VpcId))
-// 	for _, entry := range group.IpPermissions {
-// 		fmt.Printf("\tProtocol: %s\n", aws.ToString(entry.IpProtocol))
-// 		var ips []string
-// 		for _, i := range entry.IpRanges {
-// 			ips = append(ips, aws.ToString(i.CidrIp))
-// 		}
-// 		fmt.Printf("\tIP Ranges: %v\n", ips)
-// 		if aws.ToInt32(entry.FromPort) == int32(0) && aws.ToInt32(entry.ToPort) == int32(0) {
-// 			fmt.Printf("\tPortRange: %d - %d\n", 0, 65535)
-// 		} else {
-// 			fmt.Printf("\tPortRange: %d - %d\n", aws.ToInt32(entry.FromPort), aws.ToInt32(entry.ToPort))
-// 		}
-// 	}
-// }
 
 func (m *NetworkPortsModule) getEC2NACLs(region string) []types.NetworkAcl {
 	var nacls []types.NetworkAcl
@@ -627,29 +602,6 @@ func (m *NetworkPortsModule) parseNacl(nacl types.NetworkAcl) NetworkAcl {
 	return naclList
 }
 
-// func printNacl(nacl types.NetworkAcl) {
-// 	fmt.Printf("ID: %s\n", aws.ToString(nacl.NetworkAclId))
-// 	fmt.Printf("Vpc ID: %s\n", aws.ToString(nacl.VpcId))
-// 	var subnets []string
-// 	for _, assoc := range nacl.Associations {
-// 		subnets = append(subnets, aws.ToString(assoc.SubnetId))
-// 	}
-// 	fmt.Printf("Associations: %v\n", subnets)
-// 	for _, entry := range nacl.Entries {
-// 		fmt.Printf("\tRuleNumber: %d\n", aws.ToInt32(entry.RuleNumber))
-// 		fmt.Printf("\tProtocol: %s\n", aws.ToString(entry.Protocol))
-// 		fmt.Printf("\tCIDR: %s\n", aws.ToString(entry.CidrBlock))
-// 		fmt.Printf("\tEgress: %t\n", aws.ToBool(entry.Egress))
-// 		if entry.PortRange == nil {
-// 			fmt.Printf("\tPortRange: all\n")
-// 		} else {
-// 			var ports types.PortRange = *entry.PortRange
-// 			fmt.Printf("\tPortRange: %d - %d\n", aws.ToInt32(ports.From), aws.ToInt32(ports.To))
-// 		}
-// 		fmt.Printf("\tRuleAction: %s\n", entry.RuleAction)
-// 	}
-// }
-
 func (m *NetworkPortsModule) getEC2Instances(region string) []types.Instance {
 	var instances []types.Instance
 	var PaginationControl *string
@@ -702,9 +654,6 @@ func (m *NetworkPortsModule) getRdsInstancesPerRegion(region string) []rds_types
 			},
 		)
 		if err != nil {
-			// if errors.As(err, &oe) {
-			// m.Errors = append(m.Errors, (fmt.Sprintf("Error: Region: %s", region)))
-			// }
 			m.modLog.Error(err.Error())
 			m.CommandCounter.Error++
 			break
@@ -762,15 +711,6 @@ func (m *NetworkPortsModule) getRDSClustersPerRegion(region string) []rds_types.
 }
 
 func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) ([]int32, []int32) {
-	/*
-		// Loop through each security group
-			// Loop through the rules for the security group
-				// Check if the rules are explicitly allowed by a NACL
-				// If not, is there a default deny?
-
-				// Print out allowed mapping
-
-	*/
 
 	var udpPorts []int32
 	var tcpPorts []int32
@@ -779,7 +719,7 @@ func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls 
 		for _, rule := range group.Rules {
 			for _, nacl := range nacls {
 				for _, port := range rule.Ports {
-					res, naclRule := nacl.Evaluate(port, rule.Protocol)
+					res, naclRule := m.Evaluate(&nacl, port, rule.Protocol)
 					if res && (naclToSG[naclRule.Protocol] == rule.Protocol || naclToSG[naclRule.Protocol] == "-1") {
 						if rule.Protocol == "-1" && naclToSG[naclRule.Protocol] == rule.Protocol {
 							tcpPorts = addPort(tcpPorts, port)
@@ -857,36 +797,33 @@ type Node struct {
 	rule NaclRule
 }
 
-func (L *NetworkAcl) Insert(rule NaclRule) {
+func (l *NetworkAcl) Insert(rule NaclRule) {
 	list := &Node{
-		next: L.head,
+		next: l.head,
 		rule: rule,
 	}
-	if L.head != nil {
-		L.head.prev = list
+	if l.head != nil {
+		l.head.prev = list
 	}
-	L.head = list
+	l.head = list
 
-	l := L.head
-	for l.next != nil {
-		l = l.next
+	head := l.head
+	for head.next != nil {
+		head = head.next
 	}
-	L.tail = l
+	l.tail = head
 }
 
-func (l *NetworkAcl) Evaluate(port int32, proto string) (bool, *NaclRule) {
+func (m *NetworkPortsModule) Evaluate(l *NetworkAcl, port int32, proto string) (bool, *NaclRule) {
 	node := l.head
 	for node != nil {
-
-		// fmt.Printf("Checking if %d/%s is allowed in: \n", port, proto) // node.rule)
-
 		if contains(node.rule.PortRange, port) {
 			if val, ok := naclToSG[node.rule.Protocol]; ok {
 				if val == proto || val == "-1" || proto == "-1" {
 					return node.rule.Action, &node.rule
 				}
 			} else {
-				fmt.Printf("Protocol: %d not supported\n", node.rule.Protocol)
+				fmt.Printf("[%s][%s] Protocol: %d not supported\n", cyan(m.output.CallingModule), cyan(m.AWSProfile), node.rule.Protocol)
 			}
 
 		}
