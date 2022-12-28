@@ -229,49 +229,14 @@ var (
 					continue
 				}
 				m := aws.NetworkPortsModule{
-					EC2Client:  ec2.NewFromConfig(AWSConfig),
-					RDSClient:  rds.NewFromConfig(AWSConfig),
-					Caller:     *caller,
-					AWSRegions: AWSRegions,
-					AWSProfile: profile,
-					Goroutines: Goroutines,
-					Verbosity:  Verbosity,
-				}
-				m.PrintNetworkPorts(AWSOutputFormat, AWSOutputDirectory)
-			}
-		},
-	}
-
-	NetworkPortsCommand = &cobra.Command{
-		Use:     "network-ports",
-		Aliases: []string{"ports", "networkports"},
-		Short:   "Enumerate potentially accessible network ports.",
-		Long: "\nUse case examples:\n" +
-			os.Args[0] + " aws network-ports --profile readonly_profile",
-		PreRun: func(cmd *cobra.Command, args []string) {
-			for _, profile := range AWSProfiles {
-				caller, err := utils.AWSWhoami(profile, cmd.Root().Version)
-				if err != nil {
-					continue
-				}
-				fmt.Printf("[%s] AWS Caller Identity: %s\n", cyan(emoji.Sprintf(":fox:cloudfox v%s :fox:", cmd.Root().Version)), *caller.Arn)
-			}
-		},
-		Run: func(cmd *cobra.Command, args []string) {
-			for _, profile := range AWSProfiles {
-				var AWSConfig = utils.AWSConfigFileLoader(profile, cmd.Root().Version)
-				caller, err := utils.AWSWhoami(profile, cmd.Root().Version)
-				if err != nil {
-					continue
-				}
-				m := aws.NetworkPortsModule{
-					EC2Client:  ec2.NewFromConfig(AWSConfig),
-					RDSClient:  rds.NewFromConfig(AWSConfig),
-					Caller:     *caller,
-					AWSRegions: AWSRegions,
-					AWSProfile: profile,
-					Goroutines: Goroutines,
-					Verbosity:  Verbosity,
+					EC2Client:       ec2.NewFromConfig(AWSConfig),
+					LightsailClient: lightsail.NewFromConfig(AWSConfig),
+					RDSClient:       rds.NewFromConfig(AWSConfig),
+					Caller:          *caller,
+					AWSRegions:      AWSRegions,
+					AWSProfile:      profile,
+					Goroutines:      Goroutines,
+					Verbosity:       Verbosity,
 				}
 				m.PrintNetworkPorts(AWSOutputFormat, AWSOutputDirectory)
 			}
@@ -1154,12 +1119,13 @@ func runAllChecksCommand(cmd *cobra.Command, args []string) {
 		ram.PrintRAM(AWSOutputFormat, AWSOutputDirectory, Verbosity)
 
 		networkPorts := aws.NetworkPortsModule{
-			EC2Client:  ec2Client,
-			RDSClient:  rdsClient,
-			Caller:     *Caller,
-			AWSProfile: profile,
-			Goroutines: Goroutines,
-			AWSRegions: AWSRegions,
+			EC2Client:       ec2Client,
+			LightsailClient: lightsailClient,
+			RDSClient:       rdsClient,
+			Caller:          *Caller,
+			AWSProfile:      profile,
+			Goroutines:      Goroutines,
+			AWSRegions:      AWSRegions,
 		}
 		networkPorts.PrintNetworkPorts(AWSOutputFormat, AWSOutputDirectory)
 

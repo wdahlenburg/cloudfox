@@ -15,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/lightsail"
+	lightsail_types "github.com/aws/aws-sdk-go-v2/service/lightsail/types"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	rds_types "github.com/aws/aws-sdk-go-v2/service/rds/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -43,8 +45,9 @@ var (
 
 type NetworkPortsModule struct {
 	// General configuration data
-	EC2Client *ec2.Client
-	RDSClient *rds.Client
+	EC2Client       *ec2.Client
+	LightsailClient *lightsail.Client
+	RDSClient       *rds.Client
 
 	Caller       sts.GetCallerIdentityOutput
 	AWSRegions   []string
@@ -199,6 +202,9 @@ func (m *NetworkPortsModule) executeChecks(r string, wg *sync.WaitGroup, dataRec
 	m.CommandCounter.Pending--
 	m.CommandCounter.Executing++
 	m.getEC2NetworkPortsPerRegion(r, dataReceiver)
+	m.CommandCounter.Executing--
+	m.CommandCounter.Executing++
+	m.getLightsailNetworkPortsPerRegion(r, dataReceiver)
 	m.CommandCounter.Executing--
 	m.CommandCounter.Executing++
 	m.getRdsServicesPerRegion(r, dataReceiver)
@@ -417,6 +423,115 @@ func (m *NetworkPortsModule) getEC2SecurityGroups(region string) []types.Securit
 	}
 
 	return securityGroups
+}
+
+func (m *NetworkPortsModule) getLightsailNetworkPortsPerRegion(r string, dataReceiver chan NetworkServices) {
+	instances := m.getLightsailInstances(r)
+
+	var wg sync.WaitGroup
+	wg.Add(len(instances))
+
+	for _, instance := range instances {
+		go func(instance lightsail_types.Instance) {
+			defer wg.Done()
+
+			var ipv4_private, ipv4_public, ipv6 []string
+			var tcpPortsInts, udpPortsInts []int32
+
+			if instance.PrivateIpAddress != nil {
+				ipv4_private = addHost(ipv4_private, aws.ToString(instance.PrivateIpAddress))
+			}
+			if instance.PublicIpAddress != nil {
+				ipv4_public = addHost(ipv4_public, aws.ToString(instance.PublicIpAddress))
+			}
+
+			//IPv6 and IPv4
+			if instance.IpAddressType == "dualstack" {
+				for _, addr := range instance.Ipv6Addresses {
+					ipv6 = addHost(ipv6, addr)
+				}
+			}
+
+			if instance.Networking != nil {
+				for _, port := range instance.Networking.Ports {
+					if port.FromPort <= port.ToPort {
+						ports := generateRange(port.FromPort, port.ToPort)
+						switch port.Protocol {
+						case "-1":
+							{
+								for _, p := range ports {
+									tcpPortsInts = addPort(tcpPortsInts, p)
+									udpPortsInts = addPort(udpPortsInts, p)
+								}
+							}
+						case "tcp":
+							{
+								for _, p := range ports {
+									tcpPortsInts = addPort(tcpPortsInts, p)
+								}
+							}
+						case "udp":
+							{
+								for _, p := range ports {
+									udpPortsInts = addPort(udpPortsInts, p)
+								}
+							}
+						}
+					}
+				}
+			}
+
+			sort.Slice(tcpPortsInts, func(i, j int) bool {
+				return tcpPortsInts[i] < tcpPortsInts[j]
+			})
+
+			sort.Slice(udpPortsInts, func(i, j int) bool {
+				return udpPortsInts[i] < udpPortsInts[j]
+			})
+
+			tcpPorts := prettyPorts(tcpPortsInts)
+			udpPorts := prettyPorts(udpPortsInts)
+
+			if m.Verbosity > 0 {
+				fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("Lightsail Instance: %s, TCP Ports: %v, UDP Ports: %v", aws.ToString(instance.Arn), tcpPorts, udpPorts))
+			}
+
+			var networkServices NetworkServices
+
+			// IPV4
+			if len(ipv4_private) > 0 {
+
+				if len(tcpPorts) > 0 {
+					networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "Lightsail", Region: r, Hosts: ipv4_private, Ports: tcpPorts, Protocol: "tcp"})
+				}
+				if len(udpPorts) > 0 {
+					networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "Lightsail", Region: r, Hosts: ipv4_private, Ports: udpPorts, Protocol: "udp"})
+				}
+			}
+
+			if len(ipv4_public) > 0 {
+
+				if len(tcpPorts) > 0 {
+					networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "Lightsail", Region: r, Hosts: ipv4_public, Ports: tcpPorts, Protocol: "tcp"})
+				}
+				if len(udpPorts) > 0 {
+					networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "Lightsail", Region: r, Hosts: ipv4_public, Ports: udpPorts, Protocol: "udp"})
+				}
+			}
+
+			// IPV6
+			if len(ipv6) > 0 {
+				if len(tcpPorts) > 0 {
+					networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "Lightsail", Region: r, Hosts: ipv6, Ports: tcpPorts, Protocol: "tcp"})
+				}
+				if len(udpPorts) > 0 {
+					networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "Lightsail", Region: r, Hosts: ipv6, Ports: udpPorts, Protocol: "udp"})
+				}
+			}
+			dataReceiver <- networkServices
+		}(instance)
+	}
+	wg.Wait()
 }
 
 func (m *NetworkPortsModule) getRdsServicesPerRegion(r string, dataReceiver chan NetworkServices) {
@@ -639,6 +754,40 @@ func (m *NetworkPortsModule) getEC2Instances(region string) []types.Instance {
 	return instances
 }
 
+func (m *NetworkPortsModule) getLightsailInstances(region string) []lightsail_types.Instance {
+	var instances []lightsail_types.Instance
+	var PaginationControl *string
+	for {
+
+		GetInstances, err := m.LightsailClient.GetInstances(
+			context.TODO(),
+			&(lightsail.GetInstancesInput{
+				PageToken: PaginationControl,
+			}),
+			func(o *lightsail.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, instance := range GetInstances.Instances {
+			instances = append(instances, instance)
+		}
+
+		if GetInstances.NextPageToken != nil {
+			PaginationControl = GetInstances.NextPageToken
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return instances
+}
+
 func (m *NetworkPortsModule) getRdsInstancesPerRegion(region string) []rds_types.DBInstance {
 	// "PaginationMarker" is a control variable used for output continuity, as AWS return the output in pages.
 	var PaginationControl *string
@@ -711,7 +860,6 @@ func (m *NetworkPortsModule) getRDSClustersPerRegion(region string) []rds_types.
 }
 
 func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) ([]int32, []int32) {
-
 	var udpPorts []int32
 	var tcpPorts []int32
 
