@@ -617,70 +617,106 @@ func (m *NetworkPortsModule) getLBServicesPerRegion(r string, dataReceiver chan 
 	LoadBalancers := m.getLoadBalancersPerRegion(r)
 
 	for _, lb := range LoadBalancers {
-		var ipv4_public, ipv4_private, ipv6 []string
-		ipv4_public = []string{aws.ToString(lb.DNSName)}
+		// Gateway ELBs run on Layer 3
+		if lb.Type != elbv2_types.LoadBalancerTypeEnumGateway {
+			var ipv4_public, ipv4_private, ipv6 []string
+			ipv4_public = []string{aws.ToString(lb.DNSName)}
 
-		var groups []SecurityGroup
-		for _, group := range lb.SecurityGroups {
-			for _, g := range securityGroups {
-				if group == aws.ToString(g.GroupId) {
-					groups = append(groups, m.parseSecurityGroup(g))
-				}
-			}
-		}
-
-		var networkAcls []NetworkAcl
-		for _, az := range lb.AvailabilityZones {
-			// Extract address from LoadBalancerAddresses
-			for _, lba := range az.LoadBalancerAddresses {
-				if lba.IPv6Address != nil {
-					ipv6 = addHost(ipv6, aws.ToString(lba.IPv6Address))
-				}
-				if lba.IpAddress != nil {
-					ipv4_public = addHost(ipv4_public, aws.ToString(lba.IpAddress))
-				}
-				if lba.PrivateIPv4Address != nil {
-					ipv4_private = addHost(ipv4_private, aws.ToString(lba.PrivateIPv4Address))
-				}
-			}
-
-			for _, nacl := range nacls {
-				for _, assoc := range nacl.Associations {
-					if aws.ToString(az.SubnetId) == aws.ToString(assoc.SubnetId) {
-						networkAcls = append(networkAcls, m.parseNacl(nacl))
+			var groups []SecurityGroup
+			for _, group := range lb.SecurityGroups {
+				for _, g := range securityGroups {
+					if group == aws.ToString(g.GroupId) {
+						groups = append(groups, m.parseSecurityGroup(g))
 					}
 				}
 			}
-		}
 
-		tcpPorts, _ := m.resolveNetworkAccess(groups, networkAcls)
-		lbPorts := m.getLBListenerPorts(lb.LoadBalancerArn, r)
-		var ports []int32
-		for _, port := range lbPorts {
-			if contains(tcpPorts, port) {
-				ports = addPort(ports, port)
+			var networkAcls []NetworkAcl
+			for _, az := range lb.AvailabilityZones {
+				// Extract address from LoadBalancerAddresses
+				for _, lba := range az.LoadBalancerAddresses {
+					if lba.IPv6Address != nil {
+						ipv6 = addHost(ipv6, aws.ToString(lba.IPv6Address))
+					}
+					if lba.IpAddress != nil {
+						ipv4_public = addHost(ipv4_public, aws.ToString(lba.IpAddress))
+					}
+					if lba.PrivateIPv4Address != nil {
+						ipv4_private = addHost(ipv4_private, aws.ToString(lba.PrivateIPv4Address))
+					}
+				}
+
+				for _, nacl := range nacls {
+					for _, assoc := range nacl.Associations {
+						if aws.ToString(az.SubnetId) == aws.ToString(assoc.SubnetId) {
+							networkAcls = append(networkAcls, m.parseNacl(nacl))
+						}
+					}
+				}
 			}
-		}
 
-		if m.Verbosity > 0 {
-			fmt.Printf("[%s][%s] %s\n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("LB: %s, TCP Ports: %v", aws.ToString(lb.LoadBalancerName), ports))
-		}
+			// If there are no security groups, add a catchall.
+			// NLBs do not have security groups
+			if len(groups) == 0 {
+				tmpSecGroup := SecurityGroup{ID: "", VpcId: "", Rules: []SecurityGroupRule{
+					{Protocol: "-1", Cidr: []string{}, Ports: generateRange(0, 65535)},
+				}}
+				groups = append(groups, tmpSecGroup)
+			}
+			tcpPorts, udpPorts := m.resolveNetworkAccess(groups, networkAcls)
+			lbTcpPorts, lbUdpPorts := m.getLBListenerPorts(lb.LoadBalancerArn, r)
+			var finalTcpPorts, finalUdpPorts []int32
+			for _, port := range lbTcpPorts {
+				if contains(tcpPorts, port) {
+					finalTcpPorts = addPort(finalTcpPorts, port)
+				}
+			}
+			for _, port := range lbUdpPorts {
+				if contains(udpPorts, port) {
+					finalUdpPorts = addPort(finalUdpPorts, port)
+				}
+			}
 
-		sort.Slice(ports, func(i, j int) bool {
-			return ports[i] < ports[j]
-		})
+			sort.Slice(finalTcpPorts, func(i, j int) bool {
+				return finalTcpPorts[i] < finalTcpPorts[j]
+			})
+			sort.Slice(finalUdpPorts, func(i, j int) bool {
+				return finalUdpPorts[i] < finalUdpPorts[j]
+			})
+			tcp := prettyPorts(finalTcpPorts)
+			udp := prettyPorts(finalUdpPorts)
 
-		if len(ports) > 0 {
+			if m.Verbosity > 0 {
+				fmt.Printf("[%s][%s] %s\n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("LB: %s, TCP Ports: %v, UDP Ports: %v", aws.ToString(lb.LoadBalancerName), finalTcpPorts, finalUdpPorts))
+			}
+
 			var networkServices NetworkServices
 
 			if len(ipv4_public) > 0 {
-				networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv4_public, Ports: prettyPorts(ports), Protocol: "tcp"})
+
+				if len(finalTcpPorts) > 0 {
+					networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv4_public, Ports: tcp, Protocol: "tcp"})
+				}
+				if len(finalUdpPorts) > 0 {
+					networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv4_public, Ports: udp, Protocol: "udp"})
+				}
 			}
 			if len(ipv4_private) > 0 {
-				networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv4_private, Ports: prettyPorts(ports), Protocol: "tcp"})
+				if len(finalTcpPorts) > 0 {
+					networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv4_private, Ports: tcp, Protocol: "tcp"})
+				}
+				if len(finalUdpPorts) > 0 {
+					networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv4_private, Ports: udp, Protocol: "udp"})
+
+				}
 			}
 			if len(ipv6) > 0 {
-				networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv6, Ports: prettyPorts(ports), Protocol: "tcp"})
+				if len(finalTcpPorts) > 0 {
+					networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv6, Ports: tcp, Protocol: "tcp"})
+				}
+				if len(finalUdpPorts) > 0 {
+					networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv6, Ports: udp, Protocol: "udp"})
+				}
 			}
 			dataReceiver <- networkServices
 		}
@@ -978,10 +1014,10 @@ func (m *NetworkPortsModule) getLoadBalancersPerRegion(region string) []elbv2_ty
 	return lbs
 }
 
-func (m *NetworkPortsModule) getLBListenerPorts(arn *string, region string) []int32 {
+func (m *NetworkPortsModule) getLBListenerPorts(arn *string, region string) ([]int32, []int32) {
 	// "PaginationMarker" is a control variable used for output continuity, as AWS return the output in pages.
 	var PaginationControl *string
-	var ports []int32
+	var tcpPorts, udpPorts []int32
 	for {
 		DescribeListeners, err := m.ELBv2Client.DescribeListeners(
 			context.TODO(),
@@ -1000,7 +1036,34 @@ func (m *NetworkPortsModule) getLBListenerPorts(arn *string, region string) []in
 		}
 
 		for _, listener := range DescribeListeners.Listeners {
-			ports = addPort(ports, aws.ToInt32(listener.Port))
+			port := aws.ToInt32(listener.Port)
+			switch listener.Protocol {
+			case elbv2_types.ProtocolEnumHttp:
+				{
+					tcpPorts = addPort(tcpPorts, port)
+				}
+			case elbv2_types.ProtocolEnumHttps:
+				{
+					tcpPorts = addPort(tcpPorts, port)
+				}
+			case elbv2_types.ProtocolEnumTcp:
+				{
+					tcpPorts = addPort(tcpPorts, port)
+				}
+			case elbv2_types.ProtocolEnumTls:
+				{
+					tcpPorts = addPort(tcpPorts, port)
+				}
+			case elbv2_types.ProtocolEnumUdp:
+				{
+					udpPorts = addPort(udpPorts, port)
+				}
+			case elbv2_types.ProtocolEnumTcpUdp:
+				{
+					tcpPorts = addPort(tcpPorts, port)
+					udpPorts = addPort(udpPorts, port)
+				}
+			}
 		}
 
 		// The "NextToken" value is nil when there's no more data to return.
@@ -1012,7 +1075,7 @@ func (m *NetworkPortsModule) getLBListenerPorts(arn *string, region string) []in
 		}
 	}
 
-	return ports
+	return tcpPorts, udpPorts
 }
 
 func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) ([]int32, []int32) {
