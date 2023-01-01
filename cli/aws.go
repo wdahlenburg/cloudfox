@@ -230,6 +230,7 @@ var (
 				}
 				m := aws.NetworkPortsModule{
 					EC2Client:       ec2.NewFromConfig(AWSConfig),
+					ELBv2Client:     elasticloadbalancingv2.NewFromConfig(AWSConfig),
 					LightsailClient: lightsail.NewFromConfig(AWSConfig),
 					RDSClient:       rds.NewFromConfig(AWSConfig),
 					Caller:          *caller,

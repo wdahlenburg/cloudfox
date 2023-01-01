@@ -15,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	elbv2_types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
 	lightsail_types "github.com/aws/aws-sdk-go-v2/service/lightsail/types"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
@@ -46,6 +48,7 @@ var (
 type NetworkPortsModule struct {
 	// General configuration data
 	EC2Client       *ec2.Client
+	ELBv2Client     *elasticloadbalancingv2.Client
 	LightsailClient *lightsail.Client
 	RDSClient       *rds.Client
 
@@ -202,6 +205,9 @@ func (m *NetworkPortsModule) executeChecks(r string, wg *sync.WaitGroup, dataRec
 	m.CommandCounter.Pending--
 	m.CommandCounter.Executing++
 	m.getEC2NetworkPortsPerRegion(r, dataReceiver)
+	m.CommandCounter.Pending--
+	m.CommandCounter.Executing++
+	m.getLBServicesPerRegion(r, dataReceiver)
 	m.CommandCounter.Executing--
 	m.CommandCounter.Executing++
 	m.getLightsailNetworkPortsPerRegion(r, dataReceiver)
@@ -604,6 +610,83 @@ func (m *NetworkPortsModule) getRdsServicesPerRegion(r string, dataReceiver chan
 	}
 }
 
+func (m *NetworkPortsModule) getLBServicesPerRegion(r string, dataReceiver chan NetworkServices) {
+	securityGroups := m.getEC2SecurityGroups(r)
+	nacls := m.getEC2NACLs(r)
+
+	LoadBalancers := m.getLoadBalancersPerRegion(r)
+
+	for _, lb := range LoadBalancers {
+		var ipv4_public, ipv4_private, ipv6 []string
+		ipv4_public = []string{aws.ToString(lb.DNSName)}
+
+		var groups []SecurityGroup
+		for _, group := range lb.SecurityGroups {
+			for _, g := range securityGroups {
+				if group == aws.ToString(g.GroupId) {
+					groups = append(groups, m.parseSecurityGroup(g))
+				}
+			}
+		}
+
+		var networkAcls []NetworkAcl
+		for _, az := range lb.AvailabilityZones {
+			// Extract address from LoadBalancerAddresses
+			for _, lba := range az.LoadBalancerAddresses {
+				if lba.IPv6Address != nil {
+					ipv6 = addHost(ipv6, aws.ToString(lba.IPv6Address))
+				}
+				if lba.IpAddress != nil {
+					ipv4_public = addHost(ipv4_public, aws.ToString(lba.IpAddress))
+				}
+				if lba.PrivateIPv4Address != nil {
+					ipv4_private = addHost(ipv4_private, aws.ToString(lba.PrivateIPv4Address))
+				}
+			}
+
+			for _, nacl := range nacls {
+				for _, assoc := range nacl.Associations {
+					if aws.ToString(az.SubnetId) == aws.ToString(assoc.SubnetId) {
+						networkAcls = append(networkAcls, m.parseNacl(nacl))
+					}
+				}
+			}
+		}
+
+		tcpPorts, _ := m.resolveNetworkAccess(groups, networkAcls)
+		lbPorts := m.getLBListenerPorts(lb.LoadBalancerArn, r)
+		var ports []int32
+		for _, port := range lbPorts {
+			if contains(tcpPorts, port) {
+				ports = addPort(ports, port)
+			}
+		}
+
+		if m.Verbosity > 0 {
+			fmt.Printf("[%s][%s] %s\n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("LB: %s, TCP Ports: %v", aws.ToString(lb.LoadBalancerName), ports))
+		}
+
+		sort.Slice(ports, func(i, j int) bool {
+			return ports[i] < ports[j]
+		})
+
+		if len(ports) > 0 {
+			var networkServices NetworkServices
+
+			if len(ipv4_public) > 0 {
+				networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv4_public, Ports: prettyPorts(ports), Protocol: "tcp"})
+			}
+			if len(ipv4_private) > 0 {
+				networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv4_private, Ports: prettyPorts(ports), Protocol: "tcp"})
+			}
+			if len(ipv6) > 0 {
+				networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "ELBv2", Region: r, Hosts: ipv6, Ports: prettyPorts(ports), Protocol: "tcp"})
+			}
+			dataReceiver <- networkServices
+		}
+	}
+}
+
 func (m *NetworkPortsModule) parseSecurityGroup(group types.SecurityGroup) SecurityGroup {
 	id := aws.ToString(group.GroupId)
 	vpcId := aws.ToString(group.VpcId)
@@ -857,6 +940,79 @@ func (m *NetworkPortsModule) getRDSClustersPerRegion(region string) []rds_types.
 	}
 
 	return clusters
+}
+
+func (m *NetworkPortsModule) getLoadBalancersPerRegion(region string) []elbv2_types.LoadBalancer {
+	// "PaginationMarker" is a control variable used for output continuity, as AWS return the output in pages.
+	var PaginationControl *string
+	var lbs []elbv2_types.LoadBalancer
+	for {
+		DescribeLoadBalancers, err := m.ELBv2Client.DescribeLoadBalancers(
+			context.TODO(),
+			&elasticloadbalancingv2.DescribeLoadBalancersInput{
+				Marker: PaginationControl,
+			},
+			func(o *elasticloadbalancingv2.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, lb := range DescribeLoadBalancers.LoadBalancers {
+			lbs = append(lbs, lb)
+		}
+
+		// The "NextToken" value is nil when there's no more data to return.
+		if DescribeLoadBalancers.NextMarker != nil {
+			PaginationControl = DescribeLoadBalancers.NextMarker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+
+	return lbs
+}
+
+func (m *NetworkPortsModule) getLBListenerPorts(arn *string, region string) []int32 {
+	// "PaginationMarker" is a control variable used for output continuity, as AWS return the output in pages.
+	var PaginationControl *string
+	var ports []int32
+	for {
+		DescribeListeners, err := m.ELBv2Client.DescribeListeners(
+			context.TODO(),
+			&elasticloadbalancingv2.DescribeListenersInput{
+				LoadBalancerArn: arn,
+				Marker:          PaginationControl,
+			},
+			func(o *elasticloadbalancingv2.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, listener := range DescribeListeners.Listeners {
+			ports = addPort(ports, aws.ToInt32(listener.Port))
+		}
+
+		// The "NextToken" value is nil when there's no more data to return.
+		if DescribeListeners.NextMarker != nil {
+			PaginationControl = DescribeListeners.NextMarker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+
+	return ports
 }
 
 func (m *NetworkPortsModule) resolveNetworkAccess(groups []SecurityGroup, nacls []NetworkAcl) ([]int32, []int32) {
