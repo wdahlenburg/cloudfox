@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancing"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/glue"
@@ -67,6 +68,7 @@ type Inventory2Module struct {
 	SNSClient            *sns.Client
 	SQSClient            *sqs.Client
 	DynamoDBClient       *dynamodb.Client
+	ElastiClient         *elasticache.Client
 
 	Caller       sts.GetCallerIdentityOutput
 	AWSRegions   []string

@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/efs"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancing"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/fsx"
@@ -231,6 +232,7 @@ var (
 				m := aws.NetworkPortsModule{
 					EC2Client:       ec2.NewFromConfig(AWSConfig),
 					ECSClient:       ecs.NewFromConfig(AWSConfig),
+					ElastiClient:    elasticache.NewFromConfig(AWSConfig),
 					ELBv2Client:     elasticloadbalancingv2.NewFromConfig(AWSConfig),
 					LightsailClient: lightsail.NewFromConfig(AWSConfig),
 					RDSClient:       rds.NewFromConfig(AWSConfig),
@@ -886,6 +888,7 @@ func runAllChecksCommand(cmd *cobra.Command, args []string) {
 		ecsClient := ecs.NewFromConfig(AWSConfig)
 		efsClient := efs.NewFromConfig(AWSConfig)
 		eksClient := eks.NewFromConfig(AWSConfig)
+		elastiClient := elasticache.NewFromConfig(AWSConfig)
 		elbClient := elasticloadbalancing.NewFromConfig(AWSConfig)
 		elbv2Client := elasticloadbalancingv2.NewFromConfig(AWSConfig)
 		fsxClient := fsx.NewFromConfig(AWSConfig)
@@ -919,6 +922,7 @@ func runAllChecksCommand(cmd *cobra.Command, args []string) {
 			EC2Client:            ec2Client,
 			ECSClient:            ecsClient,
 			EKSClient:            eksClient,
+			ElastiClient:         elastiClient,
 			ELBClient:            elbClient,
 			ELBv2Client:          elbv2Client,
 			GlueClient:           glueClient,

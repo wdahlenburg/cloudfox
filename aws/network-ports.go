@@ -18,6 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecs_types "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/aws-sdk-go-v2/service/elasticache"
+	elasticache_types "github.com/aws/aws-sdk-go-v2/service/elasticache/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbv2_types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
@@ -52,6 +54,7 @@ type NetworkPortsModule struct {
 	// General configuration data
 	EC2Client       *ec2.Client
 	ECSClient       *ecs.Client
+	ElastiClient    *elasticache.Client
 	ELBv2Client     *elasticloadbalancingv2.Client
 	LightsailClient *lightsail.Client
 	RDSClient       *rds.Client
@@ -212,6 +215,9 @@ func (m *NetworkPortsModule) executeChecks(r string, wg *sync.WaitGroup, dataRec
 	m.CommandCounter.Pending--
 	m.CommandCounter.Executing++
 	m.getECSNetworkPortsPerRegion(r, dataReceiver)
+	m.CommandCounter.Pending--
+	m.CommandCounter.Executing++
+	m.getElastiCacheServicesPerRegion(r, dataReceiver)
 	m.CommandCounter.Pending--
 	m.CommandCounter.Executing++
 	m.getLBServicesPerRegion(r, dataReceiver)
@@ -535,6 +541,116 @@ func (m *NetworkPortsModule) getECSNetworkPortsPerRegion(r string, dataReceiver 
 				dataReceiver <- networkServices
 			}
 		}
+	}
+}
+
+func (m *NetworkPortsModule) getElastiCacheServicesPerRegion(r string, dataReceiver chan NetworkServices) {
+	securityGroups := m.getEC2SecurityGroups(r)
+	nacls := m.getEC2NACLs(r)
+
+	ElastiClusters := m.getElastiCacheClustersPerRegion(r)
+	subnetGroups := m.getElastiCacheSubnetGroupPerRegion(r)
+	nodes := m.getElastiCacheReplicationGroupsPerRegion(r)
+
+	var reportedClusters []string
+
+	for _, cluster := range ElastiClusters {
+
+		var ipv4_private []string
+		var tcpPortsInts []int32
+
+		var networkAcls []NetworkAcl
+
+		// if aws.ToString(cluster.CacheClusterStatus) == "available" {
+
+		// Get Subnets
+		subnetGroup := aws.ToString(cluster.CacheSubnetGroupName)
+		for _, group := range subnetGroups {
+			if subnetGroup == aws.ToString(group.CacheSubnetGroupName) {
+				for _, subnet := range group.Subnets {
+					for _, nacl := range nacls {
+						for _, assoc := range nacl.Associations {
+							if aws.ToString(subnet.SubnetIdentifier) == aws.ToString(assoc.SubnetId) {
+								networkAcls = append(networkAcls, m.parseNacl(nacl))
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Security Groups
+		var groups []SecurityGroup
+		for _, group := range cluster.SecurityGroups {
+			for _, g := range securityGroups {
+				if aws.ToString(group.SecurityGroupId) == aws.ToString(g.GroupId) {
+					groups = append(groups, m.parseSecurityGroup(g))
+				}
+			}
+		}
+
+		// Networking
+
+		// Memcached
+		if cluster.ConfigurationEndpoint != nil {
+			ipv4_private = addHost(ipv4_private, aws.ToString(cluster.ConfigurationEndpoint.Address))
+			tcpPortsInts = addPort(tcpPortsInts, cluster.ConfigurationEndpoint.Port)
+		} else {
+			replicationGroupId := aws.ToString(cluster.ReplicationGroupId)
+			for _, group := range nodes {
+				if replicationGroupId == aws.ToString(group.ReplicationGroupId) {
+					for _, g := range group.NodeGroups {
+						// Primary
+						if g.PrimaryEndpoint != nil && !strContains(reportedClusters, aws.ToString(g.PrimaryEndpoint.Address)) {
+							ipv4_private = addHost(ipv4_private, aws.ToString(g.PrimaryEndpoint.Address))
+							tcpPortsInts = addPort(tcpPortsInts, g.PrimaryEndpoint.Port)
+
+							reportedClusters = addHost(reportedClusters, aws.ToString(g.PrimaryEndpoint.Address))
+						}
+
+						// Reader
+						if g.ReaderEndpoint != nil && !strContains(reportedClusters, aws.ToString(g.ReaderEndpoint.Address)) {
+							ipv4_private = addHost(ipv4_private, aws.ToString(g.ReaderEndpoint.Address))
+							tcpPortsInts = addPort(tcpPortsInts, g.ReaderEndpoint.Port)
+
+							reportedClusters = addHost(reportedClusters, aws.ToString(g.ReaderEndpoint.Address))
+						}
+
+						// NodeGroupMembers
+						for _, m := range g.NodeGroupMembers {
+							if aws.ToString(m.CacheClusterId) == aws.ToString(cluster.CacheClusterId) {
+								if m.ReadEndpoint != nil {
+									ipv4_private = addHost(ipv4_private, aws.ToString(m.ReadEndpoint.Address))
+									tcpPortsInts = addPort(tcpPortsInts, m.ReadEndpoint.Port)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		tcpPorts, _ := m.resolveNetworkAccess(groups, networkAcls)
+		var tcpPortsFinal []int32
+		for _, port := range tcpPortsInts {
+			if contains(tcpPorts, port) {
+				tcpPortsFinal = addPort(tcpPortsFinal, port)
+			}
+		}
+
+		sort.Slice(tcpPortsFinal, func(i, j int) bool {
+			return tcpPortsFinal[i] < tcpPortsFinal[j]
+		})
+
+		var networkServices NetworkServices
+		for _, i := range ipv4_private {
+			if m.Verbosity > 0 {
+				fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("ElastiCache: %s, TCP Ports: %v, UDP Ports: []", i, tcpPortsFinal))
+			}
+			networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "ElastiCache", Region: r, Hosts: []string{i}, Ports: prettyPorts(tcpPortsFinal), Protocol: "tcp"})
+		}
+
+		dataReceiver <- networkServices
 	}
 }
 
@@ -1201,6 +1317,108 @@ func (m *NetworkPortsModule) describeECSTask(task string, clusterArn *string, re
 	}
 
 	return &result, nil
+}
+
+func (m *NetworkPortsModule) getElastiCacheClustersPerRegion(region string) []elasticache_types.CacheCluster {
+	var clusters []elasticache_types.CacheCluster
+	var PaginationControl *string
+	for {
+
+		DescribeCacheClusters, err := m.ElastiClient.DescribeCacheClusters(
+			context.TODO(),
+			&(elasticache.DescribeCacheClustersInput{
+				Marker: PaginationControl,
+			}),
+			func(o *elasticache.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, cluster := range DescribeCacheClusters.CacheClusters {
+			clusters = append(clusters, cluster)
+		}
+
+		if DescribeCacheClusters.Marker != nil {
+			PaginationControl = DescribeCacheClusters.Marker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return clusters
+}
+
+func (m *NetworkPortsModule) getElastiCacheSubnetGroupPerRegion(region string) []elasticache_types.CacheSubnetGroup {
+	var groups []elasticache_types.CacheSubnetGroup
+	var PaginationControl *string
+	for {
+
+		DescribeCacheSubnetGroups, err := m.ElastiClient.DescribeCacheSubnetGroups(
+			context.TODO(),
+			&(elasticache.DescribeCacheSubnetGroupsInput{
+				Marker: PaginationControl,
+			}),
+			func(o *elasticache.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, group := range DescribeCacheSubnetGroups.CacheSubnetGroups {
+			groups = append(groups, group)
+		}
+
+		if DescribeCacheSubnetGroups.Marker != nil {
+			PaginationControl = DescribeCacheSubnetGroups.Marker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return groups
+}
+
+func (m *NetworkPortsModule) getElastiCacheReplicationGroupsPerRegion(region string) []elasticache_types.ReplicationGroup {
+	var groups []elasticache_types.ReplicationGroup
+	var PaginationControl *string
+	for {
+
+		DescribeCacheReplicationGroups, err := m.ElastiClient.DescribeReplicationGroups(
+			context.TODO(),
+			&(elasticache.DescribeReplicationGroupsInput{
+				Marker: PaginationControl,
+			}),
+			func(o *elasticache.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, group := range DescribeCacheReplicationGroups.ReplicationGroups {
+			groups = append(groups, group)
+		}
+
+		if DescribeCacheReplicationGroups.Marker != nil {
+			PaginationControl = DescribeCacheReplicationGroups.Marker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return groups
 }
 
 func (m *NetworkPortsModule) getLightsailInstances(region string) []lightsail_types.Instance {
