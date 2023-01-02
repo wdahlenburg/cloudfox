@@ -2,6 +2,7 @@ package aws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecs_types "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbv2_types "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/lightsail"
@@ -48,6 +51,7 @@ var (
 type NetworkPortsModule struct {
 	// General configuration data
 	EC2Client       *ec2.Client
+	ECSClient       *ecs.Client
 	ELBv2Client     *elasticloadbalancingv2.Client
 	LightsailClient *lightsail.Client
 	RDSClient       *rds.Client
@@ -205,6 +209,9 @@ func (m *NetworkPortsModule) executeChecks(r string, wg *sync.WaitGroup, dataRec
 	m.CommandCounter.Pending--
 	m.CommandCounter.Executing++
 	m.getEC2NetworkPortsPerRegion(r, dataReceiver)
+	m.CommandCounter.Pending--
+	m.CommandCounter.Executing++
+	m.getECSNetworkPortsPerRegion(r, dataReceiver)
 	m.CommandCounter.Pending--
 	m.CommandCounter.Executing++
 	m.getLBServicesPerRegion(r, dataReceiver)
@@ -398,37 +405,137 @@ func (m *NetworkPortsModule) getEC2NetworkPortsPerRegion(r string, dataReceiver 
 	wg.Wait()
 }
 
-func (m *NetworkPortsModule) getEC2SecurityGroups(region string) []types.SecurityGroup {
-	var securityGroups []types.SecurityGroup
-	var PaginationControl *string
+func (m *NetworkPortsModule) getECSNetworkPortsPerRegion(r string, dataReceiver chan NetworkServices) {
+	securityGroups := m.getEC2SecurityGroups(r)
+	nacls := m.getEC2NACLs(r)
 
-	for {
-		DescribeSecurityGroups, err := m.EC2Client.DescribeSecurityGroups(
-			context.TODO(),
-			&(ec2.DescribeSecurityGroupsInput{
-				NextToken: PaginationControl,
-			}),
-			func(o *ec2.Options) {
-				o.Region = region
-			},
-		)
-		if err != nil {
-			m.modLog.Error(err.Error())
-			m.CommandCounter.Error++
-			break
-		}
+	clustersArns := m.getECSClusters(r)
 
-		securityGroups = append(securityGroups, DescribeSecurityGroups.SecurityGroups...)
+	for _, clusterArn := range clustersArns {
+		servicesArns := m.getECSServices(&clusterArn, r)
+		for _, serviceArn := range servicesArns {
 
-		if DescribeSecurityGroups.NextToken != nil {
-			PaginationControl = DescribeSecurityGroups.NextToken
-		} else {
-			PaginationControl = nil
-			break
+			service, err := m.describeECSService(serviceArn, &clusterArn, r)
+			if err != nil {
+				m.modLog.Error(err.Error())
+				m.CommandCounter.Error++
+				break
+			}
+
+			var groups []SecurityGroup
+			var networkAcls []NetworkAcl
+			if service.NetworkConfiguration != nil {
+				if service.NetworkConfiguration.AwsvpcConfiguration != nil {
+					// Subnets
+					for _, subnet := range service.NetworkConfiguration.AwsvpcConfiguration.Subnets {
+						for _, nacl := range nacls {
+							for _, assoc := range nacl.Associations {
+								if subnet == aws.ToString(assoc.SubnetId) {
+									networkAcls = append(networkAcls, m.parseNacl(nacl))
+								}
+							}
+						}
+					}
+
+					// Security Groups
+					for _, group := range service.NetworkConfiguration.AwsvpcConfiguration.SecurityGroups {
+						for _, g := range securityGroups {
+							if group == aws.ToString(g.GroupId) {
+								groups = append(groups, m.parseSecurityGroup(g))
+							}
+						}
+					}
+				}
+			}
+
+			// Get Tasks associated with service
+			taskArns := m.getECSTasks(service.ServiceName, &clusterArn, r)
+			for _, taskArn := range taskArns {
+
+				task, err := m.describeECSTask(taskArn, &clusterArn, r)
+				if err != nil {
+					m.modLog.Error(err.Error())
+					m.CommandCounter.Error++
+					break
+				}
+
+				var interfaces []types.NetworkInterface
+				for _, attachment := range task.Attachments {
+					for _, detail := range attachment.Details {
+						if aws.ToString(detail.Name) == "networkInterfaceId" {
+							networkInterfaces := m.getEC2NetworkInterface(aws.ToString(detail.Value), r)
+							interfaces = append(interfaces, networkInterfaces...)
+						}
+					}
+				}
+
+				var ipv4_public, ipv4_private, ipv6 []string
+
+				// Get the IPs associated with each interface
+				for _, nic := range interfaces {
+					for _, addr := range nic.PrivateIpAddresses {
+						if addr.Association != nil {
+							if addr.Association.PublicIp != nil {
+								ipv4_public = addHost(ipv4_public, aws.ToString(addr.Association.PublicIp))
+							}
+						}
+
+						if addr.PrivateIpAddress != nil {
+							ipv4_private = addHost(ipv4_private, aws.ToString(addr.PrivateIpAddress))
+						}
+					}
+
+					for _, addr := range nic.Ipv6Addresses {
+						if addr.Ipv6Address != nil {
+							ipv6 = addHost(ipv6, aws.ToString(addr.Ipv6Address))
+						}
+					}
+				}
+
+				tcpPortsInts, udpPortsInts := m.resolveNetworkAccess(groups, networkAcls)
+				tcpPorts := prettyPorts(tcpPortsInts)
+				udpPorts := prettyPorts(udpPortsInts)
+
+				if m.Verbosity > 0 {
+					fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("ECS: %s, TCP Ports: %v, UDP Ports: %v", taskArn, tcpPorts, udpPorts))
+				}
+
+				var networkServices NetworkServices
+
+				// IPV4
+				if len(ipv4_private) > 0 {
+
+					if len(tcpPorts) > 0 {
+						networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "ECS", Region: r, Hosts: ipv4_private, Ports: tcpPorts, Protocol: "tcp"})
+					}
+					if len(udpPorts) > 0 {
+						networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "ECS", Region: r, Hosts: ipv4_private, Ports: udpPorts, Protocol: "udp"})
+					}
+				}
+
+				if len(ipv4_public) > 0 {
+
+					if len(tcpPorts) > 0 {
+						networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "ECS", Region: r, Hosts: ipv4_public, Ports: tcpPorts, Protocol: "tcp"})
+					}
+					if len(udpPorts) > 0 {
+						networkServices.IPv4_Public = append(networkServices.IPv4_Public, NetworkService{AWSService: "ECS", Region: r, Hosts: ipv4_public, Ports: udpPorts, Protocol: "udp"})
+					}
+				}
+
+				// IPV6
+				if len(ipv6) > 0 {
+					if len(tcpPorts) > 0 {
+						networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "ECS", Region: r, Hosts: ipv6, Ports: tcpPorts, Protocol: "tcp"})
+					}
+					if len(udpPorts) > 0 {
+						networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "ECS", Region: r, Hosts: ipv6, Ports: udpPorts, Protocol: "udp"})
+					}
+				}
+				dataReceiver <- networkServices
+			}
 		}
 	}
-
-	return securityGroups
 }
 
 func (m *NetworkPortsModule) getLightsailNetworkPortsPerRegion(r string, dataReceiver chan NetworkServices) {
@@ -723,6 +830,39 @@ func (m *NetworkPortsModule) getLBServicesPerRegion(r string, dataReceiver chan 
 	}
 }
 
+func (m *NetworkPortsModule) getEC2SecurityGroups(region string) []types.SecurityGroup {
+	var securityGroups []types.SecurityGroup
+	var PaginationControl *string
+
+	for {
+		DescribeSecurityGroups, err := m.EC2Client.DescribeSecurityGroups(
+			context.TODO(),
+			&(ec2.DescribeSecurityGroupsInput{
+				NextToken: PaginationControl,
+			}),
+			func(o *ec2.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		securityGroups = append(securityGroups, DescribeSecurityGroups.SecurityGroups...)
+
+		if DescribeSecurityGroups.NextToken != nil {
+			PaginationControl = DescribeSecurityGroups.NextToken
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+
+	return securityGroups
+}
+
 func (m *NetworkPortsModule) parseSecurityGroup(group types.SecurityGroup) SecurityGroup {
 	id := aws.ToString(group.GroupId)
 	vpcId := aws.ToString(group.VpcId)
@@ -871,6 +1011,196 @@ func (m *NetworkPortsModule) getEC2Instances(region string) []types.Instance {
 		}
 	}
 	return instances
+}
+
+func (m *NetworkPortsModule) getEC2NetworkInterface(interfaceId string, region string) []types.NetworkInterface {
+	var interfaces []types.NetworkInterface
+	var PaginationControl *string
+	for {
+
+		DescribeNetworkInterfaces, err := m.EC2Client.DescribeNetworkInterfaces(
+			context.TODO(),
+			&(ec2.DescribeNetworkInterfacesInput{
+				NetworkInterfaceIds: []string{interfaceId},
+				NextToken:           PaginationControl,
+			}),
+			func(o *ec2.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, networkInterface := range DescribeNetworkInterfaces.NetworkInterfaces {
+			interfaces = append(interfaces, networkInterface)
+		}
+
+		if DescribeNetworkInterfaces.NextToken != nil {
+			PaginationControl = DescribeNetworkInterfaces.NextToken
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return interfaces
+}
+
+func (m *NetworkPortsModule) getECSClusters(region string) []string {
+	var clusters []string
+	var PaginationControl *string
+	for {
+
+		ListClusters, err := m.ECSClient.ListClusters(
+			context.TODO(),
+			&(ecs.ListClustersInput{
+				NextToken: PaginationControl,
+			}),
+			func(o *ecs.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, cluster := range ListClusters.ClusterArns {
+			clusters = append(clusters, cluster)
+		}
+
+		if ListClusters.NextToken != nil {
+			PaginationControl = ListClusters.NextToken
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return clusters
+}
+
+func (m *NetworkPortsModule) getECSServices(clusterArn *string, region string) []string {
+	var services []string
+	var PaginationControl *string
+	for {
+
+		ListServices, err := m.ECSClient.ListServices(
+			context.TODO(),
+			&(ecs.ListServicesInput{
+				Cluster:   clusterArn,
+				NextToken: PaginationControl,
+			}),
+			func(o *ecs.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, service := range ListServices.ServiceArns {
+			services = append(services, service)
+		}
+
+		if ListServices.NextToken != nil {
+			PaginationControl = ListServices.NextToken
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return services
+}
+
+func (m *NetworkPortsModule) describeECSService(serviceArn string, clusterArn *string, region string) (*ecs_types.Service, error) {
+	var result ecs_types.Service
+	DescribeServices, err := m.ECSClient.DescribeServices(
+		context.TODO(),
+		&(ecs.DescribeServicesInput{
+			Services: []string{serviceArn},
+			Cluster:  clusterArn,
+		}),
+		func(o *ecs.Options) {
+			o.Region = region
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(DescribeServices.Services) != 1 {
+		return nil, errors.New(fmt.Sprintf("Service not found: %s", serviceArn))
+	} else {
+		result = DescribeServices.Services[0]
+	}
+
+	return &result, nil
+}
+
+func (m *NetworkPortsModule) getECSTasks(service *string, clusterArn *string, region string) []string {
+	var tasks []string
+	var PaginationControl *string
+	for {
+
+		ListTasks, err := m.ECSClient.ListTasks(
+			context.TODO(),
+			&(ecs.ListTasksInput{
+				ServiceName: service,
+				Cluster:     clusterArn,
+				NextToken:   PaginationControl,
+			}),
+			func(o *ecs.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, task := range ListTasks.TaskArns {
+			tasks = append(tasks, task)
+		}
+
+		if ListTasks.NextToken != nil {
+			PaginationControl = ListTasks.NextToken
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return tasks
+}
+
+func (m *NetworkPortsModule) describeECSTask(task string, clusterArn *string, region string) (*ecs_types.Task, error) {
+	var result ecs_types.Task
+	DescribeTasks, err := m.ECSClient.DescribeTasks(
+		context.TODO(),
+		&(ecs.DescribeTasksInput{
+			Tasks:   []string{task},
+			Cluster: clusterArn,
+		}),
+		func(o *ecs.Options) {
+			o.Region = region
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(DescribeTasks.Tasks) != 1 {
+		return nil, errors.New(fmt.Sprintf("Service not found: %s", task))
+	} else {
+		result = DescribeTasks.Tasks[0]
+	}
+
+	return &result, nil
 }
 
 func (m *NetworkPortsModule) getLightsailInstances(region string) []lightsail_types.Instance {
