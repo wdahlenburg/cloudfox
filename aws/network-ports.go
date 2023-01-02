@@ -18,6 +18,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecs_types "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/aws-sdk-go-v2/service/efs"
+	efs_types "github.com/aws/aws-sdk-go-v2/service/efs/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	elasticache_types "github.com/aws/aws-sdk-go-v2/service/elasticache/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
@@ -54,6 +56,7 @@ type NetworkPortsModule struct {
 	// General configuration data
 	EC2Client       *ec2.Client
 	ECSClient       *ecs.Client
+	EFSClient       *efs.Client
 	ElastiClient    *elasticache.Client
 	ELBv2Client     *elasticloadbalancingv2.Client
 	LightsailClient *lightsail.Client
@@ -215,6 +218,9 @@ func (m *NetworkPortsModule) executeChecks(r string, wg *sync.WaitGroup, dataRec
 	m.CommandCounter.Pending--
 	m.CommandCounter.Executing++
 	m.getECSNetworkPortsPerRegion(r, dataReceiver)
+	m.CommandCounter.Pending--
+	m.CommandCounter.Executing++
+	m.getEFSNetworkPortsPerRegion(r, dataReceiver)
 	m.CommandCounter.Pending--
 	m.CommandCounter.Executing++
 	m.getElastiCacheServicesPerRegion(r, dataReceiver)
@@ -538,6 +544,65 @@ func (m *NetworkPortsModule) getECSNetworkPortsPerRegion(r string, dataReceiver 
 						networkServices.IPv6 = append(networkServices.IPv6, NetworkService{AWSService: "ECS", Region: r, Hosts: ipv6, Ports: udpPorts, Protocol: "udp"})
 					}
 				}
+				dataReceiver <- networkServices
+			}
+		}
+	}
+}
+
+func (m *NetworkPortsModule) getEFSNetworkPortsPerRegion(r string, dataReceiver chan NetworkServices) {
+	securityGroups := m.getEC2SecurityGroups(r)
+	nacls := m.getEC2NACLs(r)
+
+	filesystems := m.getEFSSharesPerRegion(r)
+
+	for _, filesystem := range filesystems {
+
+		targets := m.getEFSMountTargetsPerRegion(filesystem.FileSystemId, r)
+		for _, target := range targets {
+
+			interfaces := m.getEC2NetworkInterface(aws.ToString(target.NetworkInterfaceId), r)
+
+			// Security Group
+			var groups []SecurityGroup
+			for _, nic := range interfaces {
+				for _, group := range nic.Groups {
+					for _, g := range securityGroups {
+						if aws.ToString(group.GroupId) == aws.ToString(g.GroupId) {
+							groups = append(groups, m.parseSecurityGroup(g))
+						}
+					}
+				}
+			}
+
+			// Network ACLs
+			var networkAcls []NetworkAcl
+			for _, nacl := range nacls {
+				for _, assoc := range nacl.Associations {
+					if aws.ToString(target.SubnetId) == aws.ToString(assoc.SubnetId) {
+						networkAcls = append(networkAcls, m.parseNacl(nacl))
+					}
+				}
+			}
+
+			tcpPorts, _ := m.resolveNetworkAccess(groups, networkAcls)
+
+			var tcpPortsFinal []int32
+			if contains(tcpPorts, 2049) {
+				tcpPortsFinal = addPort(tcpPortsFinal, 2049)
+			}
+
+			sort.Slice(tcpPortsFinal, func(i, j int) bool {
+				return tcpPortsFinal[i] < tcpPortsFinal[j]
+			})
+
+			var networkServices NetworkServices
+			if len(tcpPortsFinal) > 0 {
+				if m.Verbosity > 0 {
+					fmt.Printf("[%s][%s] %s \n", cyan(m.output.CallingModule), cyan(m.AWSProfile), fmt.Sprintf("EFS: %s, TCP Ports: %v, UDP Ports: []", aws.ToString(target.IpAddress), tcpPortsFinal))
+				}
+				networkServices.IPv4_Private = append(networkServices.IPv4_Private, NetworkService{AWSService: "EFS", Region: r, Hosts: []string{aws.ToString(target.IpAddress)}, Ports: prettyPorts(tcpPortsFinal), Protocol: "tcp"})
+
 				dataReceiver <- networkServices
 			}
 		}
@@ -1317,6 +1382,75 @@ func (m *NetworkPortsModule) describeECSTask(task string, clusterArn *string, re
 	}
 
 	return &result, nil
+}
+
+func (m *NetworkPortsModule) getEFSSharesPerRegion(region string) []efs_types.FileSystemDescription {
+	var shares []efs_types.FileSystemDescription
+	var PaginationControl *string
+	for {
+
+		DescribeFileSystems, err := m.EFSClient.DescribeFileSystems(
+			context.TODO(),
+			&(efs.DescribeFileSystemsInput{
+				Marker: PaginationControl,
+			}),
+			func(o *efs.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, fs := range DescribeFileSystems.FileSystems {
+			shares = append(shares, fs)
+		}
+
+		if DescribeFileSystems.Marker != nil {
+			PaginationControl = DescribeFileSystems.Marker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return shares
+}
+
+func (m *NetworkPortsModule) getEFSMountTargetsPerRegion(filesystem *string, region string) []efs_types.MountTargetDescription {
+	var targets []efs_types.MountTargetDescription
+	var PaginationControl *string
+	for {
+
+		DescribeMountTargets, err := m.EFSClient.DescribeMountTargets(
+			context.TODO(),
+			&(efs.DescribeMountTargetsInput{
+				FileSystemId: filesystem,
+				Marker:       PaginationControl,
+			}),
+			func(o *efs.Options) {
+				o.Region = region
+			},
+		)
+		if err != nil {
+			m.modLog.Error(err.Error())
+			m.CommandCounter.Error++
+			break
+		}
+
+		for _, target := range DescribeMountTargets.MountTargets {
+			targets = append(targets, target)
+		}
+
+		if DescribeMountTargets.Marker != nil {
+			PaginationControl = DescribeMountTargets.Marker
+		} else {
+			PaginationControl = nil
+			break
+		}
+	}
+	return targets
 }
 
 func (m *NetworkPortsModule) getElastiCacheClustersPerRegion(region string) []elasticache_types.CacheCluster {
